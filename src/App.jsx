@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import MuscleHeatmap from './components/MuscleHeatmap';
+import OnboardingWizard from './components/OnboardingWizard';
 
 const API_BASE = 'http://127.0.0.1:8000';
 
@@ -202,22 +204,10 @@ export default function DashboardMaster() {
   // ==========================================
   if (!isSetupComplete) {
     return (
-      <div className="min-h-screen bg-neutral-950 text-white flex flex-col items-center justify-center font-mono p-4">
-        <div className="max-w-md w-full bg-neutral-900 border border-neutral-800 p-8 rounded-2xl text-center space-y-6 shadow-2xl relative overflow-hidden">
-          <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-orange-500 to-transparent animate-pulse"></div>
-          <div className="w-20 h-20 bg-neutral-950 border border-neutral-800 rounded-full mx-auto flex items-center justify-center mb-4">
-            <span className="text-4xl">🤖</span>
-          </div>
-          <h1 className="text-2xl font-black tracking-widest text-orange-500">SİSTEM KİLİTLİ</h1>
-          <p className="text-sm text-neutral-400 leading-relaxed">
-            AI.COACH_OS başlatılamıyor. Telegram botuna henüz profil oluşturmadın ya da hiç rapor girmedin.
-          </p>
-          <div className="bg-neutral-950 p-4 rounded-xl border border-neutral-800 text-left text-xs space-y-2">
-            <p className="text-emerald-400 font-bold">ÇÖZÜM:</p>
-            <p className="text-neutral-500">Telegram botuna gidip <code className="text-orange-400">/profil</code> komutuyla profilini oluştur, sonra yediğin bir şeyi rapor et.</p>
-          </div>
-        </div>
-      </div>
+      <OnboardingWizard onComplete={() => {
+        setLoading(true);
+        fetchDashboardData();
+      }} />
     );
   }
 
@@ -346,7 +336,7 @@ export default function DashboardMaster() {
               </div>
             )}
 
-            {!loadingDaily && Object.keys(dailyHeatmap).length > 0 && (
+            {!loadingDaily && (
               <div className="bg-neutral-900 border border-neutral-800 p-5 rounded-2xl">
                 <h3 className="text-xs font-mono uppercase text-neutral-400 tracking-wider mb-4">🔥 O Günün Kas Isı Haritası</h3>
                 <MuscleHeatmap data={dailyHeatmap} />
@@ -612,105 +602,5 @@ function WeightSparkline({ metrics }) {
     <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-16">
       <path d={path} fill="none" stroke="#f97316" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
-  );
-}
-
-// Set sayısına göre ısı rengi belirler. Eşikler haftalık hipertrofi hacim standartlarına
-// yaklaşık dayanır (haftada ~10-20 set/kas grubu optimal aralık kabul edilir).
-function getHeatColor(sets) {
-  if (!sets || sets === 0) return '#3f3f46';        // neutral-700 - hiç çalışılmamış (nötr gri gövde)
-  if (sets <= 4) return '#78350f';                   // amber-900 - düşük
-  if (sets <= 8) return '#f97316';                   // orange-500 - orta
-  if (sets <= 14) return '#ea580c';                  // orange-600 - yüksek
-  return '#dc2626';                                  // red-600 - çok yüksek
-}
-
-// Referans anatomi görseline benzer, ÖN ve ARKA gövdeyi yan yana gösteren ısı haritası.
-// Nötr gri bir vücut siluetinin üzerine, o gün çalışılan kas gruplarını renklendiriyor.
-// Kol ve Bacak hem ön (biceps/quad) hem arka (triceps/hamstring-glute) görünümde aynı
-// renkte çıkar çünkü veri modelimizde bu ayrım yok, tek "Kol"/"Bacak" kategorisi var.
-function MuscleHeatmap({ data }) {
-  const sets = (group) => (data[group]?.sets) || 0;
-  const c = (group) => getHeatColor(sets(group));
-  const neutral = '#27272a'; // el, ayak, kafa gibi takip edilmeyen bölgeler
-
-  const legendGroups = ['Göğüs', 'Sırt', 'Omuz', 'Kol', 'Karın', 'Bacak'];
-
-  return (
-    <div className="flex flex-col md:flex-row items-center gap-6">
-      <svg viewBox="0 0 400 340" className="w-full max-w-md h-auto shrink-0">
-        {/* ========== ÖN GÖRÜNÜM ========== */}
-        <g>
-          {/* Kafa + boyun */}
-          <ellipse cx="95" cy="26" rx="15" ry="17" fill={neutral} />
-          <rect x="87" y="40" width="16" height="14" rx="4" fill={neutral} />
-          {/* Trapez (Sırt - önden az görünen kısım) */}
-          <path d="M70,54 L95,46 L120,54 L112,62 L95,56 L78,62 Z" fill={c('Sırt')} />
-          {/* Omuzlar (deltoid) */}
-          <ellipse cx="62" cy="70" rx="15" ry="14" fill={c('Omuz')} />
-          <ellipse cx="128" cy="70" rx="15" ry="14" fill={c('Omuz')} />
-          {/* Göğüs (pektoral - iki parça, ortada birleşen) */}
-          <path d="M95,60 C80,58 68,66 66,82 C65,96 78,108 95,104 L95,60 Z" fill={c('Göğüs')} />
-          <path d="M95,60 C110,58 122,66 124,82 C125,96 112,108 95,104 L95,60 Z" fill={c('Göğüs')} />
-          {/* Kollar (biceps) */}
-          <path d="M50,80 C40,84 36,100 40,130 C42,145 48,152 54,150 C58,148 56,130 55,110 C54,95 56,84 50,80 Z" fill={c('Kol')} />
-          <path d="M140,80 C150,84 154,100 150,130 C148,145 142,152 136,150 C132,148 134,130 135,110 C136,95 134,84 140,80 Z" fill={c('Kol')} />
-          {/* Ön kollar (aynı grup, daha soluk ton verilmez - tutarlılık için aynı renk) */}
-          <rect x="38" y="148" width="14" height="52" rx="6" fill={c('Kol')} />
-          <rect x="138" y="148" width="14" height="52" rx="6" fill={c('Kol')} />
-          {/* Karın (6 parçalı) */}
-          {[0, 1, 2].map((row) => (
-            <g key={row}>
-              <rect x="80" y={108 + row * 17} width="13" height="14" rx="3" fill={c('Karın')} />
-              <rect x="97" y={108 + row * 17} width="13" height="14" rx="3" fill={c('Karın')} />
-            </g>
-          ))}
-          {/* Bacaklar (quad) */}
-          <path d="M78,162 C70,180 68,220 72,260 C74,278 82,280 88,278 C92,276 92,240 90,210 C89,190 90,172 78,162 Z" fill={c('Bacak')} />
-          <path d="M112,162 C120,180 122,220 118,260 C116,278 108,280 102,278 C98,276 98,240 100,210 C101,190 100,172 112,162 Z" fill={c('Bacak')} />
-          {/* Alt bacak + ayak (nötr) */}
-          <rect x="74" y="278" width="14" height="45" rx="6" fill={neutral} />
-          <rect x="102" y="278" width="14" height="45" rx="6" fill={neutral} />
-        </g>
-
-        {/* ========== ARKA GÖRÜNÜM ========== */}
-        <g transform="translate(210, 0)">
-          <ellipse cx="95" cy="26" rx="15" ry="17" fill={neutral} />
-          <rect x="87" y="40" width="16" height="14" rx="4" fill={neutral} />
-          {/* Trapez + üst sırt */}
-          <path d="M68,52 L95,44 L122,52 L118,80 L95,72 L72,80 Z" fill={c('Sırt')} />
-          {/* Lats (kanat şeklinde geniş sırt kası) */}
-          <path d="M72,80 C60,90 56,115 66,140 C74,155 88,158 95,150 L95,72 Z" fill={c('Sırt')} />
-          <path d="M118,80 C130,90 134,115 124,140 C116,155 102,158 95,150 L95,72 Z" fill={c('Sırt')} />
-          {/* Arka omuz */}
-          <ellipse cx="62" cy="70" rx="14" ry="13" fill={c('Omuz')} />
-          <ellipse cx="128" cy="70" rx="14" ry="13" fill={c('Omuz')} />
-          {/* Triceps */}
-          <path d="M50,80 C40,84 36,100 40,130 C42,145 48,152 54,150 C58,148 56,130 55,110 C54,95 56,84 50,80 Z" fill={c('Kol')} />
-          <path d="M140,80 C150,84 154,100 150,130 C148,145 142,152 136,150 C132,148 134,130 135,110 C136,95 134,84 140,80 Z" fill={c('Kol')} />
-          <rect x="38" y="148" width="14" height="52" rx="6" fill={c('Kol')} />
-          <rect x="138" y="148" width="14" height="52" rx="6" fill={c('Kol')} />
-          {/* Bel - alt sırt */}
-          <path d="M83,150 L107,150 L104,168 L86,168 Z" fill={c('Sırt')} />
-          {/* Kalça (glute) + hamstring - Bacak grubu */}
-          <path d="M75,168 C68,172 66,190 70,205 C73,215 88,216 90,205 C92,195 90,178 85,168 Z" fill={c('Bacak')} />
-          <path d="M115,168 C122,172 124,190 120,205 C117,215 102,216 100,205 C98,195 100,178 105,168 Z" fill={c('Bacak')} />
-          <path d="M76,205 C72,225 72,250 76,270 C78,278 86,278 87,270 C88,250 88,225 84,208 Z" fill={c('Bacak')} />
-          <path d="M114,205 C118,225 118,250 114,270 C112,278 104,278 103,270 C102,250 102,225 106,208 Z" fill={c('Bacak')} />
-          <rect x="74" y="278" width="14" height="45" rx="6" fill={neutral} />
-          <rect x="102" y="278" width="14" height="45" rx="6" fill={neutral} />
-        </g>
-      </svg>
-
-      <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-xs font-mono w-full md:w-48 shrink-0">
-        {legendGroups.map((group) => (
-          <div key={group} className="flex items-center gap-2">
-            <span className="w-3 h-3 rounded-sm shrink-0" style={{ backgroundColor: getHeatColor(sets(group)) }}></span>
-            <span className="text-neutral-400">{group}</span>
-            <span className="text-neutral-300 ml-auto">{sets(group)}</span>
-          </div>
-        ))}
-      </div>
-    </div>
   );
 }

@@ -27,19 +27,123 @@ if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     exit(1)
 
 # --- ONBOARDING (İLK KURULUM) SOHBET AKIŞI ---
-# Kullanıcının hayatına/isteklerine göre kişiselleştirme burada başlıyor.
-(ASK_AGE, ASK_HEIGHT, ASK_WEIGHT, ASK_GOAL, ASK_ACTIVITY, ASK_DIET, ASK_SCHEDULE) = range(7)
+# Video + ses kayıtları ile kullanıcıyı tanıma, ardından temel bilgiler.
+(ASK_BODY_VIDEO, ASK_AUDIO_NUTRITION, ASK_AUDIO_TRAINING, ASK_AUDIO_LIFESTYLE,
+ ASK_AGE, ASK_HEIGHT, ASK_WEIGHT, ASK_GOAL) = range(8)
 
 # --- ANKET (SORU-CEVAP) TARZI PLAN OLUŞTURMA AKIŞI ---
 # Beslenme ve antrenman anketleri aynı state makinesini paylaşır (ikisi de aynı yapı:
 # N soru sor -> taslak üret -> onay/düzeltme döngüsü).
-INTERVIEW_ASKING, INTERVIEW_REVIEW = range(7, 9)
+INTERVIEW_ASKING, INTERVIEW_REVIEW = range(8, 10)
 
 
 async def profil_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     await update.message.reply_text(
-        "⚡ Profilini oluşturalım efendim. Sana özel program ve beslenme planı için birkaç şey soracağım.\n\n"
-        "Yaşın kaç?"
+        "⚡ Profilini oluşturalım efendim. Sana özel program ve beslenme planı için "
+        "önce seni gerçekten tanımam lazım.\n\n"
+        "📹 **ADIM 1 — Vücut Videosu**\n"
+        "İyi aydınlatılmış bir ortamda (doğal ışık veya parlak lamba), spor kıyafetiyle "
+        "10-15 saniyelik bir video çek ve buraya gönder.\n\n"
+        "• Ön ve yan açılardan vücudunu göster\n"
+        "• Kollarını yanına indir, sonra hafifçe kaslarını göster\n"
+        "• Aynada veya tripod ile kaydet\n\n"
+        "Hazır olunca videoyu gönder 👇",
+        parse_mode='Markdown',
+    )
+    return ASK_BODY_VIDEO
+
+
+async def receive_body_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.video and not update.message.video_note:
+        await update.message.reply_text("Lütfen bir video gönder efendim (video notu da olur).")
+        return ASK_BODY_VIDEO
+
+    await update.message.reply_text("🔍 Vücut videonu analiz ediyorum, bir saniye...")
+    if update.message.video:
+        tg_file = await update.message.video.get_file()
+        mime_type = "video/mp4"
+    else:
+        tg_file = await update.message.video_note.get_file()
+        mime_type = "video/mp4"
+
+    video_bytes = bytes(await tg_file.download_as_bytearray())
+    context.user_data["onboarding_video"] = video_bytes
+    context.user_data["onboarding_video_mime"] = mime_type
+
+    await update.message.reply_text(
+        "✅ Video alındı!\n\n"
+        "🎙️ **ADIM 2 — Güncel Beslenmen**\n"
+        "Şimdi bir **sesli mesaj** kaydet ve güncel beslenmeni anlat:\n"
+        "• Ne yiyorsun, kaç öğün?\n"
+        "• Protein alımın nasıl?\n"
+        "• Sevmediğin yiyecekler, alerjiler?",
+        parse_mode='Markdown',
+    )
+    return ASK_AUDIO_NUTRITION
+
+
+async def receive_audio_nutrition(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.voice:
+        await update.message.reply_text("Lütfen sesli mesaj olarak kaydet efendim 🎙️")
+        return ASK_AUDIO_NUTRITION
+
+    await update.message.reply_text("🎙️ Dinliyorum...")
+    tg_file = await update.message.voice.get_file()
+    audio_bytes = bytes(await tg_file.download_as_bytearray())
+    transcript = ai_core.transcribe_audio(audio_bytes, "audio/ogg")
+    context.user_data["onboarding_nutrition"] = transcript
+    await update.message.reply_text(f"📝 Anladığım: \"{transcript[:200]}{'...' if len(transcript) > 200 else ''}\"")
+
+    await update.message.reply_text(
+        "🎙️ **ADIM 3 — Güncel Antrenmanın**\n"
+        "Sesli mesaj kaydet ve antrenmanını anlat:\n"
+        "• Hangi günler antrenman yapıyorsun?\n"
+        "• Hangi hareketler, deneyim seviyen?\n"
+        "• Sakatlık veya kısıtlama var mı?",
+        parse_mode='Markdown',
+    )
+    return ASK_AUDIO_TRAINING
+
+
+async def receive_audio_training(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.voice:
+        await update.message.reply_text("Lütfen sesli mesaj olarak kaydet efendim 🎙️")
+        return ASK_AUDIO_TRAINING
+
+    await update.message.reply_text("🎙️ Dinliyorum...")
+    tg_file = await update.message.voice.get_file()
+    audio_bytes = bytes(await tg_file.download_as_bytearray())
+    transcript = ai_core.transcribe_audio(audio_bytes, "audio/ogg")
+    context.user_data["onboarding_training"] = transcript
+    await update.message.reply_text(f"📝 Anladığım: \"{transcript[:200]}{'...' if len(transcript) > 200 else ''}\"")
+
+    await update.message.reply_text(
+        "🎙️ **ADIM 4 — Günlük Yaşamın**\n"
+        "Son ses kaydı — günlük rutinini anlat:\n"
+        "• Uyku saatlerin?\n"
+        "• İş/okul yoğunluğun?\n"
+        "• Ne zaman antrenman yapmayı tercih edersin?",
+        parse_mode='Markdown',
+    )
+    return ASK_AUDIO_LIFESTYLE
+
+
+async def receive_audio_lifestyle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.voice:
+        await update.message.reply_text("Lütfen sesli mesaj olarak kaydet efendim 🎙️")
+        return ASK_AUDIO_LIFESTYLE
+
+    await update.message.reply_text("🎙️ Dinliyorum...")
+    tg_file = await update.message.voice.get_file()
+    audio_bytes = bytes(await tg_file.download_as_bytearray())
+    transcript = ai_core.transcribe_audio(audio_bytes, "audio/ogg")
+    context.user_data["onboarding_lifestyle"] = transcript
+    await update.message.reply_text(f"📝 Anladığım: \"{transcript[:200]}{'...' if len(transcript) > 200 else ''}\"")
+
+    await update.message.reply_text(
+        "Harika efendim, seni oldukça iyi tanıdım! Son birkaç sayısal bilgi:\n\n"
+        "**Yaşın kaç?**"
     )
     return ASK_AGE
 
@@ -59,66 +163,54 @@ async def ask_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ask_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["weight"] = update.message.text
     await update.message.reply_text(
-        "Hedefin ne? (örn: kilo almak / yağ yakmak / recomp / formumu korumak) "
+        "Hedefin ne? (örn: kas kütlesi artırmak / yağ yakmak / formumu korumak)\n"
         "İstersen hedef fiziğini de tarif et."
     )
     return ASK_GOAL
 
 
-async def ask_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["goal"] = update.message.text
-    await update.message.reply_text(
-        "Günlük aktivite/yaşam tarzın nasıl? (masa başı iş mi, hareketli mi, ne sıklıkla antrenman yapıyorsun?)"
-    )
-    return ASK_ACTIVITY
-
-async def ask_diet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["activity"] = update.message.text
-    await update.message.reply_text(
-        "Beslenme tercihlerin/kısıtlamaların var mı? (sevmediğin, yiyemediğin, alerjin olan şeyler)"
-    )
-    return ASK_DIET
-
-
-async def ask_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["diet"] = update.message.text
-    await update.message.reply_text(
-        "Son soru: Günlük rutinin nasıl? (uyku saatlerin, iş/okul yoğunluğun, sabah mı akşam mı antrenman yapmayı tercih edersin)"
-    )
-    return ASK_SCHEDULE
-
-
 async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["schedule"] = update.message.text
+    context.user_data["goal"] = update.message.text
     ud = context.user_data
+
+    await update.message.reply_text(
+        "⏳ Tüm verilerini analiz edip sana özel profil, beslenme ve antrenman programı "
+        "hazırlıyorum efendim... Bu biraz sürebilir."
+    )
 
     db = SessionLocal()
     try:
-        crud.update_profile(db, {
-            "age": _safe_int(ud.get("age")),
-            "height": _safe_float(ud.get("height")),
-            "current_weight": _safe_float(ud.get("weight")),
-            "goal": ud.get("goal"),
-            "activity_level": ud.get("activity"),
-            "dietary_notes": ud.get("diet"),
-            "schedule_notes": ud.get("schedule"),
-            "onboarding_completed": True,
-        })
+        result = ai_core.complete_onboarding(
+            db,
+            video_bytes=ud.get("onboarding_video"),
+            video_mime=ud.get("onboarding_video_mime", "video/mp4"),
+            nutrition_transcript=ud.get("onboarding_nutrition", ""),
+            training_transcript=ud.get("onboarding_training", ""),
+            lifestyle_transcript=ud.get("onboarding_lifestyle", ""),
+            age=_safe_int(ud.get("age")),
+            height=_safe_float(ud.get("height")),
+            weight=_safe_float(ud.get("weight")),
+            goal=ud.get("goal"),
+        )
     finally:
         db.close()
 
+    if result.get("physique_report"):
+        await update.message.reply_text(f"📊 [VÜCUT ANALİZİ]\n\n{result['physique_report'][:3500]}")
+
+    if result.get("onboarding_summary"):
+        await update.message.reply_text(f"🧠 {result['onboarding_summary']}")
+
     await update.message.reply_text(
-        "✅ Profilin oluşturuldu efendim. Artık seni tanıyorum — bundan sonra yediğin her şeyi, "
-        "yaptığın her antrenmanı ve kilonu buraya yazman yeterli, gerisini ben takip edeceğim.\n\n"
-        "Şimdi sana özel bir beslenme ve antrenman programı hazırlıyorum, birazdan gelecek. "
-        "İstediğin zaman /beslenme veya /antrenman ile yeniden oluşturabilir, /analiz ile "
-        "haftalık özet alabilirsin."
+        "✅ Profilin oluşturuldu efendim! Artık seni tanıyorum — yediğin her şeyi, "
+        "yaptığın her antrenmanı buraya yazman yeterli.\n\n"
+        "Beslenme ve antrenman programın hazır. Dashboard'da da görebilirsin.\n"
+        "İstediğin zaman /beslenme veya /antrenman ile yeniden oluşturabilirsin."
     )
 
-    await update.message.reply_text("🍽️ Menü hazırlanıyor...")
     db = SessionLocal()
     try:
-        items = ai_core.generate_meal_plan(db)
+        items = crud.get_meal_plan(db)
     finally:
         db.close()
     if items:
@@ -127,10 +219,9 @@ async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"🍴 {item.meal_name} ({item.time_target or '-'})\n   {item.description}\n   {item.calories:.0f} kcal | {item.protein:.0f}g protein")
         await update.message.reply_text("\n\n".join(lines))
 
-    await update.message.reply_text("🏋️ Antrenman programı hazırlanıyor...")
     db = SessionLocal()
     try:
-        programs = ai_core.generate_workout_program(db)
+        programs = crud.get_workout_programs(db)
     finally:
         db.close()
     if programs:
@@ -659,15 +750,25 @@ def main():
     onboarding_handler = ConversationHandler(
         entry_points=[CommandHandler("profil", profil_start)],
         states={
+            ASK_BODY_VIDEO: [
+                MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, receive_body_video),
+            ],
+            ASK_AUDIO_NUTRITION: [
+                MessageHandler(filters.VOICE, receive_audio_nutrition),
+            ],
+            ASK_AUDIO_TRAINING: [
+                MessageHandler(filters.VOICE, receive_audio_training),
+            ],
+            ASK_AUDIO_LIFESTYLE: [
+                MessageHandler(filters.VOICE, receive_audio_lifestyle),
+            ],
             ASK_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_height)],
             ASK_HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_weight)],
             ASK_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_goal)],
-            ASK_GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_activity)],
-            ASK_ACTIVITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_diet)],
-            ASK_DIET: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_schedule)],
-            ASK_SCHEDULE: [MessageHandler(filters.TEXT & ~filters.COMMAND, finish_onboarding)],
+            ASK_GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, finish_onboarding)],
         },
         fallbacks=[CommandHandler("iptal", cancel_onboarding)],
+        allow_reentry=True,
     )
 
     app.add_handler(CommandHandler("start", range_start))

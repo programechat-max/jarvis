@@ -898,6 +898,168 @@ SADECE aşağıdaki JSON formatında yanıt ver, başka hiçbir şey yazma:
             db.close()
 
 
+def calculate_macro_targets(age, height, weight, goal, activity_level="moderate"):
+    """Profil verilerinden günlük kalori ve makro hedeflerini hesaplar (Mifflin-St Jeor)."""
+    if not all([age, height, weight]):
+        return {"daily_calorie_target": 2200, "daily_protein_target": 140,
+                "daily_carb_target": 220, "daily_fat_target": 70}
+
+    bmr = 10 * weight + 6.25 * height - 5 * age + 5
+    multipliers = {"sedentary": 1.2, "light": 1.375, "moderate": 1.55, "active": 1.725}
+    act = (activity_level or "moderate").lower()
+    tdee = bmr * multipliers.get(act, 1.55)
+
+    goal_lower = (goal or "").lower()
+    if any(w in goal_lower for w in ["yağ", "cut", "kilo ver", "zayıf", "defin"]):
+        calories = tdee * 0.85
+        protein = weight * 2.2
+    elif any(w in goal_lower for w in ["kilo al", "bulk", "kas", "hipertrofi", "kütlesi"]):
+        calories = tdee * 1.10
+        protein = weight * 2.0
+    else:
+        calories = tdee
+        protein = weight * 1.8
+
+    fat = calories * 0.25 / 9
+    carbs = (calories - protein * 4 - fat * 9) / 4
+    return {
+        "daily_calorie_target": round(calories),
+        "daily_protein_target": round(protein),
+        "daily_carb_target": round(max(carbs, 0)),
+        "daily_fat_target": round(fat),
+    }
+
+
+def complete_onboarding(
+    db,
+    video_bytes: bytes = None,
+    video_mime: str = "video/mp4",
+    nutrition_transcript: str = "",
+    training_transcript: str = "",
+    lifestyle_transcript: str = "",
+    age: int = None,
+    height: float = None,
+    weight: float = None,
+    goal: str = "",
+):
+    """Video + ses kayıtları + temel bilgilerden kişiselleştirilmiş profil oluşturur,
+    makro hedeflerini hesaplar ve beslenme/antrenman programı üretir."""
+    physique_analysis = None
+    if video_bytes:
+        physique_analysis = analyze_physique_media(video_bytes, video_mime, db)
+
+    system_instruction = BASE_PERSONA
+    model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=system_instruction)
+
+    physique_block = ""
+    if physique_analysis and physique_analysis.get("memory_summary"):
+        physique_block = f"\nVÜCUT VİDEO ANALİZİ:\n{physique_analysis['memory_summary']}\n"
+
+    prompt = f"""
+Kullanıcının onboarding (ilk kurulum) verilerini analiz et ve profil alanlarını doldur.
+
+{physique_block}
+GÜNCEL BESLENME (ses kaydı transkripti):
+{nutrition_transcript or 'belirtilmedi'}
+
+GÜNCEL ANTRENMAN (ses kaydı transkripti):
+{training_transcript or 'belirtilmedi'}
+
+GÜNLÜK YAŞAM (ses kaydı transkripti):
+{lifestyle_transcript or 'belirtilmedi'}
+
+TEMEL BİLGİLER (kullanıcının girdiği):
+- Yaş: {age}, Boy: {height} cm, Kilo: {weight} kg
+- Hedef: {goal}
+
+SADECE aşağıdaki JSON formatında yanıt ver:
+
+{{
+  "goal": "kısa hedef özeti (bulk/cut/recomp/maintain veya Türkçe açıklama)",
+  "target_physique": "hedeflediği fiziksel görünüm (1-2 cümle)",
+  "experience_months": <tahmini antrenman deneyimi ay cinsinden, sayı>,
+  "focus_muscle_group": "öncelikli kas grubu veya 'genel/dengeli'",
+  "activity_level": "sedentary|light|moderate|active",
+  "dietary_notes": "beslenme tercihleri, kısıtlamalar, alerjiler - ses kaydından çıkar",
+  "schedule_notes": "uyku, iş yoğunluğu, antrenman zamanı tercihi - ses kaydından çıkar",
+  "injury_notes": "sakatlık/kısıtlama varsa, yoksa boş string",
+  "onboarding_summary": "2-3 cümlelik Jarvis tonunda kullanıcı özeti (hafızaya kaydedilecek)"
+}}
+"""
+    try:
+        response = model.generate_content(
+            prompt, generation_config={"response_mime_type": "application/json", "temperature": 0.4}
+        )
+        parsed = json.loads(response.text)
+    except Exception as e:
+        logger.error(f"[AI_CORE] Onboarding sentez hatası: {e}")
+        parsed = {
+            "goal": goal or "recomp",
+            "dietary_notes": nutrition_transcript[:500] if nutrition_transcript else "",
+            "schedule_notes": lifestyle_transcript[:500] if lifestyle_transcript else "",
+            "activity_level": "moderate",
+            "experience_months": 0,
+            "focus_muscle_group": "",
+            "target_physique": "",
+            "injury_notes": "",
+            "onboarding_summary": "Profil oluşturuldu.",
+        }
+
+    macros = calculate_macro_targets(
+        age, height, weight,
+        parsed.get("goal") or goal,
+        parsed.get("activity_level", "moderate"),
+    )
+
+    profile_data = {
+        "age": age,
+        "height": height,
+        "current_weight": weight,
+        "goal": parsed.get("goal") or goal,
+        "target_physique": parsed.get("target_physique", ""),
+        "experience_months": parsed.get("experience_months") or 0,
+        "focus_muscle_group": parsed.get("focus_muscle_group", ""),
+        "activity_level": parsed.get("activity_level", "moderate"),
+        "dietary_notes": parsed.get("dietary_notes", ""),
+        "schedule_notes": parsed.get("schedule_notes", ""),
+        "injury_notes": parsed.get("injury_notes", ""),
+        "onboarding_completed": True,
+        **macros,
+    }
+    crud.update_profile(db, profile_data)
+
+    summary_parts = []
+    if nutrition_transcript:
+        crud.create_memory(db, category="onboarding_nutrition", content=nutrition_transcript[:2000])
+        summary_parts.append(f"Beslenme: {nutrition_transcript[:200]}")
+    if training_transcript:
+        crud.create_memory(db, category="onboarding_training", content=training_transcript[:2000])
+        summary_parts.append(f"Antrenman: {training_transcript[:200]}")
+    if lifestyle_transcript:
+        crud.create_memory(db, category="onboarding_lifestyle", content=lifestyle_transcript[:2000])
+        summary_parts.append(f"Yaşam: {lifestyle_transcript[:200]}")
+
+    if parsed.get("onboarding_summary"):
+        crud.create_memory(db, category="onboarding", content=parsed["onboarding_summary"])
+
+    training_instruction = None
+    nutrition_instruction = None
+    if physique_analysis:
+        training_instruction = physique_analysis.get("training_instruction")
+        nutrition_instruction = physique_analysis.get("nutrition_instruction")
+
+    meal_plan = generate_meal_plan(db, user_instruction=nutrition_instruction)
+    workout_programs = generate_workout_program(db, user_instruction=training_instruction)
+
+    return {
+        "profile": profile_data,
+        "physique_report": physique_analysis.get("report") if physique_analysis else None,
+        "onboarding_summary": parsed.get("onboarding_summary"),
+        "meal_plan_count": len(meal_plan) if meal_plan else 0,
+        "workout_days": len(workout_programs) if workout_programs else 0,
+    }
+
+
 def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
     """Telegram'dan gelen bir sesli mesajı (voice note) Türkçe metne çevirir.
     Bu fonksiyon SADECE transkripsiyon yapar - anlamlandırma/kaydetme işini yapmaz.
