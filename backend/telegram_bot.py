@@ -676,8 +676,16 @@ async def process_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
 
-    result = ai_core.process_message(user_text)
+    history = context.user_data.setdefault("chat_history", [])
+    history.append({"role": "user", "text": user_text})
+    if len(history) > 12:
+        context.user_data["chat_history"] = history[-12:]
+
+    result = ai_core.process_message(user_text, conversation_history=history)
     reply = result.get("jarvis_reply") or "Anladım efendim."
+
+    history.append({"role": "assistant", "text": reply[:500]})
+    context.user_data["chat_history"] = history[-12:]
 
     intent = result.get("intent")
     if intent == "log_workout":
