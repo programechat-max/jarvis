@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -46,6 +46,52 @@ def get_profile(db: Session = Depends(get_db)):
 @app.put("/api/profile", response_model=schemas.UserProfileResponse)
 def update_profile(data: schemas.UserProfileBase, db: Session = Depends(get_db)):
     return crud.update_profile(db, data.model_dump(exclude_unset=True))
+
+
+# ==========================================
+# ONBOARDING (video + ses kayıtları ile profil oluşturma)
+# ==========================================
+@app.post("/api/onboarding/complete")
+async def complete_onboarding(
+    video: UploadFile = File(...),
+    nutrition_audio: UploadFile = File(...),
+    training_audio: UploadFile = File(...),
+    lifestyle_audio: UploadFile = File(...),
+    age: int = Form(...),
+    height: float = Form(...),
+    weight: float = Form(...),
+    goal: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Web onboarding sihirbazından gelen video + 3 ses kaydı + temel bilgileri işler."""
+    video_bytes = await video.read()
+    video_mime = video.content_type or "video/mp4"
+
+    nutrition_bytes = await nutrition_audio.read()
+    training_bytes = await training_audio.read()
+    lifestyle_bytes = await lifestyle_audio.read()
+
+    nutrition_mime = nutrition_audio.content_type or "audio/webm"
+    training_mime = training_audio.content_type or "audio/webm"
+    lifestyle_mime = lifestyle_audio.content_type or "audio/webm"
+
+    nutrition_transcript = ai_core.transcribe_audio(nutrition_bytes, nutrition_mime)
+    training_transcript = ai_core.transcribe_audio(training_bytes, training_mime)
+    lifestyle_transcript = ai_core.transcribe_audio(lifestyle_bytes, lifestyle_mime)
+
+    result = ai_core.complete_onboarding(
+        db,
+        video_bytes=video_bytes,
+        video_mime=video_mime,
+        nutrition_transcript=nutrition_transcript,
+        training_transcript=training_transcript,
+        lifestyle_transcript=lifestyle_transcript,
+        age=age,
+        height=height,
+        weight=weight,
+        goal=goal,
+    )
+    return {"status": "completed", **result}
 
 
 # ==========================================

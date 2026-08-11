@@ -6,3 +6,4 @@ python-dotenv
 google-generativeai
 python-telegram-bot[job-queue]
 pytz
+python-multipart
