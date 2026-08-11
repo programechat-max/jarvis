@@ -28,6 +28,7 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=API_KEY)
 
 MODEL_NAME = "gemini-2.5-flash"
+AI_CORE_VERSION = "2026-08-12-meal-plan-v2"
 
 BASE_PERSONA = """
 Sen kullanıcının kişisel 'Jarvis' adındaki elit, sadık ve zeki fitness/sağlık asistanısın.
@@ -256,7 +257,8 @@ WHOLE_PLAN_RE = re.compile(
     r"ogun(?:ler(?:im(?:i)?|ini|i)?)?|yemek(?:ler(?:im(?:i)?|ini|i)?)?)|"
     r"butun\s+(?:plan(?:im(?:i)?|a)?|menu(?:m(?:u)?)?|ogun(?:ler(?:im(?:i)?|ini|i)?)?|"
     r"yemek(?:ler(?:im(?:i)?|ini|i)?)?|beslenme)|"
-    r"(?:ogun|yemek)lerim(?:i|in|in\s+hepsi|in\s+tamami)?|"
+    r"(?:ogun|yemek)lerim(?:i|in|e|in\s+hepsi|in\s+tamami)?|"
+    r"(?:ogun|yemek)lerime|"
     r"(?:hepsi|tamami|tumu)\s+(?:ogun|yemek|menu|plan)|"
     r"hepsini\s+(?:yedim|aldim|bitirdim|tamamladim|uyguladim)|"
     r"(?:beslenme\s+)?(?:program|plan)(?:im|imi|a)?\s*(?:uygula|uyguladim|takip|yedim|bitirdim|tamamladim|aldim)|"
@@ -389,7 +391,7 @@ def _wants_whole_plan_log(message: str) -> bool:
         return True
     if LOG_ACTION_RE.search(msg) and re.search(
         r"(?:tum|butun|hepsi|tamami|tumu)\s*(?:ogun|yemek)|"
-        r"(?:ogun|yemek)lerim(?:i|in)?|"
+        r"(?:ogun|yemek)lerim(?:i|in|e)?|(?:ogun|yemek)lerime|"
         r"hepsini\s+(?:ogun|yemek|menu)",
         msg,
     ):
@@ -617,10 +619,20 @@ def try_resolve_plan_food_locally(user_message: str, db) -> dict | None:
     return None
 
 
+def _clean_user_message(message: str) -> str:
+    """Baştaki/sondaki boşluk ve noktalama — eşleştirme için."""
+    if not message:
+        return ""
+    cleaned = message.strip()
+    cleaned = re.sub(r"^[\"'«»]+|[\"'«»!?.,;:]+$", "", cleaned).strip()
+    return cleaned or message.strip()
+
+
 def process_message(user_message: str, db=None, conversation_history: list | None = None) -> dict:
     """Tek giriş noktası: mesajı analiz eder, intent'e göre veritabanına yazar
     ve kullanıcıya verilecek yanıtı döndürür. Telegram botu ve ileride
     API/chat endpoint'i bu fonksiyonu kullanır."""
+    user_message = _clean_user_message(user_message)
     own_session = db is None
     if own_session:
         db = SessionLocal()
@@ -628,6 +640,10 @@ def process_message(user_message: str, db=None, conversation_history: list | Non
         # Plan tabanlı yemek kaydı — AI'den önce kural tabanlı çöz (daha güvenilir)
         local_food = try_resolve_plan_food_locally(user_message, db)
         if local_food:
+            logger.info(
+                "[AI_CORE] Yerel plan eşleştirme: %r -> %s",
+                user_message, local_food.get("jarvis_reply", "")[:80],
+            )
             return local_food
 
         operational_context = build_operational_context(db, conversation_history)
