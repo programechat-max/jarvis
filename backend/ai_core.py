@@ -91,19 +91,19 @@ JSON dışında hiçbir şey yazma.
 {
   "intent": "log_food" | "log_workout" | "log_weight" | "remember" | "query_history" | "modify_meal_plan" | "delete_meal_plan" | "delete_food_log" | "modify_workout_program" | "delete_workout_program" | "chat",
   "data": {
-    // log_food ise: "meal_name", "description", "calories", "protein", "carbs", "fats", "matched_plan_meal"
+    // log_food ise: "meal_name", "description", "calories", "protein", "carbs", "fats",
+    //   "matched_plan_meal", "log_entire_plan"
     //   KURAL 1 - Kullanıcı NE YEDİĞİNİ somut olarak tarif ettiyse (malzeme/miktar belirtmiş,
     //     örn. "3 yumurta yedim", "150g tavuk ve pirinç yedim"): description'a bunu yaz,
-    //     calories/protein/carbs/fats'ı bu tarife göre rasyonel hesapla. matched_plan_meal: null.
-    //   KURAL 2 - Kullanıcı SADECE "planımdaki kahvaltıyı/öğle yemeğimi/X öğününü yedim" gibi
-    //     BELİRSİZ bir ifade kullandıysa (ne yediğini TARİF ETMEDEN, sadece plan öğününe atıfla):
-    //     calories/protein/carbs/fats alanlarına 0 yaz (bunlar KULLANILMAYACAK, kod gerçek plan
-    //     verisini DB'den çekip kullanacak) ve matched_plan_meal alanına o öğünün planındaki
-    //     TAM meal_name'ini yaz (örn. "Kahvaltı", "Öğle Yemeği") - SİSTEM PROMPT'taki güncel
-    //     BESLENME PLANI bölümünden hangi öğün olduğunu belirle. Eşleşen öğün yoksa null yaz ve
-    //     jarvis_reply'de kullanıcıya ne yediğini sorman GEREKİR, kaydetme.
-    //   ASLA sayısal alanlara rastgele/uydurma değer yazıp matched_plan_meal'i de null bırakma -
-    //     ya somut tarife dayalı gerçek hesap yap, ya da plana yönlendir, ikisi de değilse SOR.
+    //     calories/protein/carbs/fats'ı bu tarife göre rasyonel hesapla. matched_plan_meal: null,
+    //     log_entire_plan: false.
+    //   KURAL 2 - Kullanıcı TEK bir plan öğününe atıf yaptıysa (örn. "planımdaki kahvaltıyı yedim",
+    //     "öğle yemeğimi yedim"): matched_plan_meal alanına plan listesindeki TAM meal_name'i yaz
+    //     (örn. "Kahvaltı", "Öğle Yemeği"). calories/protein/carbs/fats: 0 yaz.
+    //   KURAL 3 - Kullanıcı TÜM planı/menüyü uyguladığını söylediyse (örn. "bugünkü beslenme
+    //     programımı uyguladım", "günün menüsünü yedim", "tüm plana uygun yedim"):
+    //     log_entire_plan: true yap, matched_plan_meal: null.
+    //   Eşleşen öğün yoksa ve somut tarif de yoksa kaydetme, ne yediğini sor.
 
     // log_workout ise: "sets" adında bir LİSTE ver. Kullanıcı tek mesajda birden fazla
     //   hareket veya set anlatabilir (örn. "bench 4x8 60kg, sonra dips 3x12 vücut ağırlığı") -
@@ -194,6 +194,237 @@ def _safe_int(value, default=0):
     return int(_safe_float(value, default))
 
 
+def _normalize_text(text: str) -> str:
+    """Türkçe karakterleri sadeleştirip küçük harfe çevirir — eşleştirme için."""
+    if not text:
+        return ""
+    text = text.lower().strip()
+    tr_map = str.maketrans("ıİğĞüÜşŞöÖçÇ", "iigguussoocc")
+    return text.translate(tr_map)
+
+
+# Yaygın öğün ifadeleri → plan öğün adlarıyla eşleştirme ipuçları
+MEAL_ALIASES = {
+    "kahvalti": ["kahvaltı", "sabah", "sabah ogunu", "sabah öğünü", "breakfast", "1. ogun", "1. öğün", "birinci ogun"],
+    "ogle": ["öğle", "öğlen", "ogle yemegi", "öğle yemeği", "lunch", "2. ogun", "2. öğün", "ikinci ogun", "oglen"],
+    "aksam": ["akşam", "aksam yemegi", "akşam yemeği", "dinner", "gece yemegi", "gece yemeği", "3. ogun", "3. öğün"],
+    "ara": ["ara ogun", "ara öğün", "atistirmalik", "atıştırmalık", "snack", "ikindi"],
+}
+
+# Tüm planı kaydetme ifadeleri (yedim/uyguladım vb. ile birlikte)
+WHOLE_PLAN_RE = re.compile(
+    r"(?:"
+    r"tum\s+(?:plan|menu|ogun|beslenme)|butun\s+(?:plan|menu|ogun)|hepsini\s+yedim|"
+    r"(?:beslenme\s+)?(?:program|plan)(?:im|imi|a)?\s*(?:uygula|uyguladim|takip|yedim|bitirdim|tamamladim|aldim)|"
+    r"(?:bugunku|gunun)\s+(?:beslenme\s+)?(?:program|plan|menu)(?:im|imi|a)?|"
+    r"(?:program|plan|menu)(?:a|ima)?\s*(?:uygun|gore)\s*(?:yedim|aldim)|"
+    r"onerd(?:igin|iginiz)\s+(?:plan|menu)|jarvis(?:'?in|in)?\s+(?:plan|menu)"
+    r")",
+    re.IGNORECASE,
+)
+
+PLAN_REFERENCE_RE = re.compile(
+    r"(?:plan(?:im)?daki|program(?:im)?daki|menu(?:m)?deki|plandan|programdan|onerdigin|onerilen)",
+    re.IGNORECASE,
+)
+
+LOG_ACTION_RE = re.compile(
+    r"(?:yedim|yaptim|uyguladim|takip\s+ettim|bitirdim|tamamladim|aldim|tükettim|tukettim|girdim)",
+    re.IGNORECASE,
+)
+
+
+def find_plan_meal(plan_items, query: str):
+    """Plan öğününü esnek eşleştirir: tam ad, kısmi ad, alias veya benzerlik."""
+    if not plan_items or not query:
+        return None
+
+    q = _normalize_text(query)
+    if not q:
+        return None
+
+    # 1) Tam eşleşme
+    for item in plan_items:
+        if _normalize_text(item.meal_name) == q:
+            return item
+
+    # 2) Birinin diğerini içermesi
+    for item in plan_items:
+        name = _normalize_text(item.meal_name)
+        if q in name or name in q:
+            return item
+
+    # 3) Alias → plan adı
+    for alias_key, aliases in MEAL_ALIASES.items():
+        terms = [_normalize_text(alias_key)] + [_normalize_text(a) for a in aliases]
+        if any(term in q for term in terms):
+            for item in plan_items:
+                name = _normalize_text(item.meal_name)
+                if any(term in name for term in terms) or alias_key in name:
+                    return item
+
+    # 4) difflib ile en yakın isim
+    from difflib import get_close_matches
+    name_map = {_normalize_text(item.meal_name): item for item in plan_items}
+    close = get_close_matches(q, list(name_map.keys()), n=1, cutoff=0.55)
+    if close:
+        return name_map[close[0]]
+
+    return None
+
+
+def _extract_meal_hint_from_message(message: str) -> str | None:
+    """Mesajdan hangi öğüne atıf yapıldığını çıkarır."""
+    msg = _normalize_text(message)
+
+    m = re.search(r"plan(?:im)?daki\s+(.+?)(?:\s+yedim|\s+aldim|\s+uyguladim|$)", msg)
+    if m:
+        return m.group(1).strip()
+
+    m = re.search(r"program(?:im)?daki\s+(.+?)(?:\s+yedim|\s+aldim|\s+uyguladim|$)", msg)
+    if m:
+        return m.group(1).strip()
+
+    for alias_key, aliases in MEAL_ALIASES.items():
+        terms = [_normalize_text(alias_key)] + [_normalize_text(a) for a in aliases]
+        if any(term in msg for term in terms):
+            return alias_key
+
+    return None
+
+
+def _wants_whole_plan_log(message: str) -> bool:
+    msg = _normalize_text(message)
+    if WHOLE_PLAN_RE.search(msg):
+        return True
+    # "bugunku beslenme programimi uyguladim" gibi ifadeler
+    if LOG_ACTION_RE.search(msg) and re.search(r"(?:beslenme\s+)?(?:program|plan|menu)", msg):
+        if not _extract_meal_hint_from_message(message):
+            return True
+    return False
+
+
+def _wants_plan_meal_log(message: str) -> bool:
+    msg = _normalize_text(message)
+    if PLAN_REFERENCE_RE.search(msg):
+        return True
+    if _extract_meal_hint_from_message(message) and LOG_ACTION_RE.search(msg):
+        return True
+    if re.search(r"(?:kahvalti|ogle|aksam|ara\s+ogun|atistirmalik).*(?:yedim|aldim|uyguladim)", msg):
+        return True
+    return False
+
+
+def _log_plan_meal(db, plan_item) -> dict:
+    """Tek plan öğününü bugünün beslenme kaydına yazar."""
+    import schemas
+    crud.create_nutrition_log(db, schemas.NutritionLogCreate(
+        meal_name=plan_item.meal_name,
+        ingredients=plan_item.description,
+        calories=plan_item.calories,
+        protein=plan_item.protein,
+        carbs=plan_item.carbs,
+        fats=plan_item.fats,
+    ))
+    return {
+        "intent": "log_food",
+        "jarvis_reply": (
+            f"✅ {plan_item.meal_name} kaydedildi efendim ({plan_item.calories:.0f} kcal, "
+            f"{plan_item.protein:.0f}g protein) — plandaki haliyle."
+        ),
+        "_food_reply_is_final": True,
+    }
+
+
+def _log_all_plan_meals(db, plan_items) -> dict:
+    """Plandaki tüm öğünleri bugüne kaydeder."""
+    import schemas
+    total_cal, total_prot = 0.0, 0.0
+    names = []
+    for item in plan_items:
+        crud.create_nutrition_log(db, schemas.NutritionLogCreate(
+            meal_name=item.meal_name,
+            ingredients=item.description,
+            calories=item.calories,
+            protein=item.protein,
+            carbs=item.carbs,
+            fats=item.fats,
+        ))
+        total_cal += item.calories or 0
+        total_prot += item.protein or 0
+        names.append(item.meal_name)
+
+    meal_list = ", ".join(names)
+    return {
+        "intent": "log_food",
+        "jarvis_reply": (
+            f"✅ Bugünkü beslenme planının tamamını kaydettim efendim: {meal_list}.\n"
+            f"Toplam: {total_cal:.0f} kcal, {total_prot:.0f}g protein."
+        ),
+        "_food_reply_is_final": True,
+    }
+
+
+def _no_plan_reply() -> dict:
+    return {
+        "intent": "chat",
+        "jarvis_reply": (
+            "Kayıtlı bir beslenme planın yok efendim. Önce /beslenme yazıp planı oluştur "
+            "ve ✅ Onayla butonuna bas; sonra 'planımdaki kahvaltıyı yedim' veya "
+            "'bugünkü beslenme programımı uyguladım' diyebilirsin."
+        ),
+        "_food_reply_is_final": True,
+    }
+
+
+def _plan_meals_list_reply(plan_items) -> dict:
+    names = ", ".join(p.meal_name for p in plan_items)
+    return {
+        "intent": "chat",
+        "jarvis_reply": (
+            f"Planında şu öğünler var efendim: {names}.\n"
+            f"Hangi öğünü yedin? Örneğin: 'planımdaki kahvaltıyı yedim' veya "
+            f"'bugünkü beslenme programımı uyguladım' diyebilirsin."
+        ),
+        "_food_reply_is_final": True,
+    }
+
+
+def try_resolve_plan_food_locally(user_message: str, db) -> dict | None:
+    """AI'ye gitmeden plan tabanlı yemek kaydını çözmeye çalışır."""
+    plan_items = crud.get_meal_plan(db)
+    msg_norm = _normalize_text(user_message)
+
+    refers_to_plan = (
+        _wants_whole_plan_log(user_message)
+        or _wants_plan_meal_log(user_message)
+        or PLAN_REFERENCE_RE.search(_normalize_text(user_message))
+    )
+
+    if not plan_items:
+        if refers_to_plan:
+            return _no_plan_reply()
+        return None
+
+    # Tüm plan
+    if _wants_whole_plan_log(user_message):
+        return _log_all_plan_meals(db, plan_items)
+
+    # Tek öğün
+    if _wants_plan_meal_log(user_message):
+        hint = _extract_meal_hint_from_message(user_message)
+        if hint:
+            matched = find_plan_meal(plan_items, hint)
+            if matched:
+                return _log_plan_meal(db, matched)
+
+        # "planımdaki X'i yedim" ama X net değil — kullanıcıya seçenekleri göster
+        if PLAN_REFERENCE_RE.search(_normalize_text(user_message)) and LOG_ACTION_RE.search(msg_norm):
+            return _plan_meals_list_reply(plan_items)
+
+    return None
+
+
 def process_message(user_message: str, db=None) -> dict:
     """Tek giriş noktası: mesajı analiz eder, intent'e göre veritabanına yazar
     ve kullanıcıya verilecek yanıtı döndürür. Telegram botu ve ileride
@@ -202,6 +433,11 @@ def process_message(user_message: str, db=None) -> dict:
     if own_session:
         db = SessionLocal()
     try:
+        # Plan tabanlı yemek kaydı — AI'den önce kural tabanlı çöz (daha güvenilir)
+        local_food = try_resolve_plan_food_locally(user_message, db)
+        if local_food:
+            return local_food
+
         system_instruction = build_system_prompt(db) + INTENT_INSTRUCTIONS
         model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=system_instruction)
 
@@ -215,58 +451,62 @@ def process_message(user_message: str, db=None) -> dict:
 
         if intent == "log_food":
             import schemas
-            matched_meal_name = data.get("matched_plan_meal")
+            plan_items = crud.get_meal_plan(db)
 
-            if matched_meal_name:
-                # Kullanıcı "planımdaki X'i yedim" dedi - AI'nin uydurduğu değil,
-                # veritabanındaki GERÇEK plan verisini kullan.
-                plan_items = crud.get_meal_plan(db)
-                matched = next(
-                    (p for p in plan_items if p.meal_name.strip().lower() == matched_meal_name.strip().lower()),
-                    None,
-                )
-                if matched:
-                    crud.create_nutrition_log(db, schemas.NutritionLogCreate(
-                        meal_name=matched.meal_name,
-                        ingredients=matched.description,
-                        calories=matched.calories,
-                        protein=matched.protein,
-                        carbs=matched.carbs,
-                        fats=matched.fats,
-                    ))
-                    result["jarvis_reply"] = (
-                        f"✅ {matched.meal_name} kaydedildi efendim ({matched.calories:.0f} kcal, "
-                        f"{matched.protein:.0f}g protein) - plandaki haliyle."
-                    )
+            if data.get("log_entire_plan"):
+                if plan_items:
+                    result.update(_log_all_plan_meals(db, plan_items))
+                else:
+                    result.update(_no_plan_reply())
+            else:
+                matched_meal_name = data.get("matched_plan_meal")
+                matched = None
+
+                if matched_meal_name:
+                    matched = find_plan_meal(plan_items, matched_meal_name)
+
+                # AI öğün adını kaçırdıysa mesajdan tekrar dene
+                if not matched and plan_items:
+                    hint = _extract_meal_hint_from_message(user_message)
+                    if hint:
+                        matched = find_plan_meal(plan_items, hint)
+                    if not matched and _wants_whole_plan_log(user_message):
+                        result.update(_log_all_plan_meals(db, plan_items))
+                        matched = "__logged_all__"
+
+                if matched == "__logged_all__":
+                    pass  # result already updated
+                elif matched:
+                    result.update(_log_plan_meal(db, matched))
+                elif matched_meal_name or _wants_plan_meal_log(user_message):
+                    if plan_items:
+                        result["jarvis_reply"] = (
+                            f"Planında '{matched_meal_name or 'bu öğün'}' bulamadım efendim. "
+                            f"Mevcut öğünler: {', '.join(p.meal_name for p in plan_items)}.\n"
+                            f"Hangi öğünü yedin?"
+                        )
+                    else:
+                        result.update(_no_plan_reply())
+                    result["intent"] = "chat"
                     result["_food_reply_is_final"] = True
                 else:
-                    # AI plan içinde eşleşme bulamadı ama yine de matched_plan_meal döndürmüş -
-                    # veri uydurmak yerine kullanıcıya sor.
-                    result["jarvis_reply"] = (
-                        "Planında bu isimde bir öğün bulamadım efendim. Ne yediğini biraz "
-                        "tarif eder misin, öyle kaydedeyim?"
-                    )
-                    result["intent"] = "chat"
-            else:
-                calories = _safe_float(data.get("calories"), default=None)
-                # AI hem plana eşlemedi hem de somut bir kalori hesaplamadıysa (description boş/
-                # belirsiz), rastgele 0 kaydetmek yerine kullanıcıya sor.
-                description = data.get("description", "").strip()
-                if calories is None and not description:
-                    result["jarvis_reply"] = (
-                        "Ne yediğini biraz daha tarif eder misin efendim? (örn. '3 yumurta ve "
-                        "1 dilim ekmek' gibi) - net bir tarif olmadan makroları uyduramam."
-                    )
-                    result["intent"] = "chat"
-                else:
-                    crud.create_nutrition_log(db, schemas.NutritionLogCreate(
-                        meal_name=data.get("meal_name", "Öğün"),
-                        ingredients=description or user_message,
-                        calories=_safe_float(data.get("calories")),
-                        protein=_safe_float(data.get("protein")),
-                        carbs=_safe_float(data.get("carbs")),
-                        fats=_safe_float(data.get("fats")),
-                    ))
+                    calories = _safe_float(data.get("calories"), default=None)
+                    description = data.get("description", "").strip()
+                    if calories is None and not description:
+                        result["jarvis_reply"] = (
+                            "Ne yediğini biraz daha tarif eder misin efendim? (örn. '3 yumurta ve "
+                            "1 dilim ekmek' gibi) - net bir tarif olmadan makroları uyduramam."
+                        )
+                        result["intent"] = "chat"
+                    else:
+                        crud.create_nutrition_log(db, schemas.NutritionLogCreate(
+                            meal_name=data.get("meal_name", "Öğün"),
+                            ingredients=description or user_message,
+                            calories=_safe_float(data.get("calories")),
+                            protein=_safe_float(data.get("protein")),
+                            carbs=_safe_float(data.get("carbs")),
+                            fats=_safe_float(data.get("fats")),
+                        ))
         elif intent == "log_workout":
             import schemas
             # AI'den birden fazla set (çoklu hareket / farklı ağırlıklar) gelebilir.
