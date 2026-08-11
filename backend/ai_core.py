@@ -27,13 +27,20 @@ logger = logging.getLogger(__name__)
 API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=API_KEY)
 
-MODEL_NAME = "gemini-3.1-flash-lite"
+MODEL_NAME = "gemini-2.5-flash"
 
 BASE_PERSONA = """
 Sen kullanıcının kişisel 'Jarvis' adındaki elit, sadık ve zeki fitness/sağlık asistanısın.
 Iron Man filmindeki Jarvis gibi asil, sadık, hafif nüktedan ve tamamen kullanıcı odaklısın.
 Kullanıcıya her zaman "efendim" diye hitap et. Kuru, robotik onay cümleleri kurma;
 onunla gerçek bir koç gibi, doğal ve samimi konuş. Yanlış bir bilgi varsa nazikçe düzelt.
+
+BİLİŞSEL YETENEKLERİN (her mesajda uygula):
+1. Önce kullanıcının GERÇEK niyetini çıkar — kelimelere değil, bağlama bak.
+2. Türkçe'deki günlük konuşma, kısaltma, yazım hatası ve sesli mesaj bozukluklarını tolere et.
+3. "Plan" ile "bugün yediklerim" ayrımını kesin yap: plan = öneri/menü, log = gerçekte yenen.
+4. Belirsizlikte en mantıklı yorumu seç; kullanıcıyı gereksiz yere sorgulama.
+5. Kullanıcının geçmiş hafızası, bugünkü kayıtları ve beslenme planı birlikte değerlendir.
 """
 
 
@@ -85,25 +92,41 @@ KULLANICI PROFİLİ:
 
 
 INTENT_INSTRUCTIONS = """
-GÖREVİN: Kullanıcının mesajını analiz et ve SADECE aşağıdaki JSON formatında yanıt dön.
+GÖREVİN: Kullanıcının mesajını DERİNLEMESİNE analiz et ve SADECE aşağıdaki JSON formatında yanıt dön.
 JSON dışında hiçbir şey yazma.
 
+ÖNCE DÜŞÜN (reasoning alanına yaz), SONRA karar ver:
+- Kullanıcı ne YAPMAK istiyor? (kaydet / sor / değiştir / sil / sohbet)
+- Beslenme PLANINA mı atıf yapıyor, yoksa rastgele bir şey mi yedi?
+- Tek öğün mü, TÜM plan/menü mü?
+- Geçmiş konuşma bağlamı var mı?
+
 {
+  "reasoning": "2-4 cümle: mesajı nasıl yorumladığın, neden bu intent'i seçtiğin (kullanıcıya gösterilmez)",
   "intent": "log_food" | "log_workout" | "log_weight" | "remember" | "query_history" | "modify_meal_plan" | "delete_meal_plan" | "delete_food_log" | "modify_workout_program" | "delete_workout_program" | "chat",
+  "confidence": "high" | "medium" | "low",
   "data": {
-    // log_food ise: "meal_name", "description", "calories", "protein", "carbs", "fats",
-    //   "matched_plan_meal", "log_entire_plan"
-    //   KURAL 1 - Kullanıcı NE YEDİĞİNİ somut olarak tarif ettiyse (malzeme/miktar belirtmiş,
-    //     örn. "3 yumurta yedim", "150g tavuk ve pirinç yedim"): description'a bunu yaz,
-    //     calories/protein/carbs/fats'ı bu tarife göre rasyonel hesapla. matched_plan_meal: null,
-    //     log_entire_plan: false.
-    //   KURAL 2 - Kullanıcı TEK bir plan öğününe atıf yaptıysa (örn. "planımdaki kahvaltıyı yedim",
-    //     "öğle yemeğimi yedim"): matched_plan_meal alanına plan listesindeki TAM meal_name'i yaz
-    //     (örn. "Kahvaltı", "Öğle Yemeği"). calories/protein/carbs/fats: 0 yaz.
-    //   KURAL 3 - Kullanıcı TÜM planı/menüyü uyguladığını söylediyse (örn. "bugünkü beslenme
-    //     programımı uyguladım", "günün menüsünü yedim", "tüm plana uygun yedim"):
-    //     log_entire_plan: true yap, matched_plan_meal: null.
-    //   Eşleşen öğün yoksa ve somut tarif de yoksa kaydetme, ne yediğini sor.
+    // log_food — KRİTİK BESLENME ANLAMA KURALLARI:
+    //
+    // A) SOMUT TARİF (plan dışı): Kullanıcı ne yediğini malzeme/miktar ile anlattı
+    //    (örn. "3 yumurta yedim", "150g tavuk pirinç"). description'a yaz, makroları hesapla.
+    //    matched_plan_meal: null, log_entire_plan: false.
+    //
+    // B) TEK PLAN ÖĞÜNÜ: Kullanıcı planındaki BİR öğünü yedi
+    //    (örn. "planımdaki kahvaltıyı yedim", "öğle yemeğimi yedim", "akşam öğünü tamam").
+    //    matched_plan_meal: GÜNCEL BESLENME PLANI listesindeki TAM meal_name (örn. "Kahvaltı").
+    //    log_entire_plan: false. Makrolar: 0 (sistem plandan alır).
+    //
+    // C) TÜM PLAN / TÜM ÖĞÜNLER — log_entire_plan: true, matched_plan_meal: null
+    //    Şu ifadelerin HEPSİ bu kategoridedir (tek öğün SANMA):
+    //    - "tüm öğünlerimi yedim", "bütün öğünlerimi yedim", "hepsini yedim"
+    //    - "bugünkü beslenme programımı uyguladım", "günün menüsünü yedim"
+    //    - "plana uygun yedim", "beslenme planıma sadık kaldım"
+    //    - "tüm planı yedim", "menüyü bitirdim", "3 öğünün hepsini yedim"
+    //    - "önerdiğin planı uyguladım", "programa göre yedim"
+    //    ÖNEMLİ: "tüm öğünlerimi" bir meal_name DEĞİLDİR — asla matched_plan_meal olarak yazma!
+    //
+    // D) Belirsiz ama yemek kaydı niyeti: somut tarif sor, uydurma yapma.
 
     // log_workout ise: "sets" adında bir LİSTE ver. Kullanıcı tek mesajda birden fazla
     //   hareket veya set anlatabilir (örn. "bench 4x8 60kg, sonra dips 3x12 vücut ağırlığı") -
@@ -119,6 +142,7 @@ JSON dışında hiçbir şey yazma.
     //   - Vücut ağırlığı hareketlerinde (mekik, dips, pull-up vb.) weight_lifted için 0 yaz.
     //   - Kullanıcı set sayısını veya tekrarı belirtmediyse mantıklı bir varsayım yap
     //     (örn. sadece "bench yaptım" derse tek set, reps_done tahmini yap) ama sayı olsun.
+    //   - Türkçe hareket adlarını İngilizce standart isme çevir (göğüs presi → Bench Press).
 
     // log_weight ise: "weight", "waist", "chest", "arm", "sleep_hours"
     // remember ise: "category" ("preference"|"note"), "content"
@@ -172,6 +196,20 @@ JSON dışında hiçbir şey yazma.
   "jarvis_reply": "Kullanıcıya Jarvis tonunda, kişiselleştirilmiş, kısa ve motive edici yanıt."
 }
 
+KARMAŞIK TÜRKÇE ANLAMA ÖRNEKLERİ (bunları doğru sınıflandır):
+| Mesaj | intent | data özeti |
+| "tüm öğünlerimi yedim" | log_food | log_entire_plan: true |
+| "hepsini yedim bugün" | log_food | log_entire_plan: true (plan varsa) |
+| "planımdaki kahvaltıyı yedim" | log_food | matched_plan_meal: "Kahvaltı" |
+| "öğle yemeğimi yedim" | log_food | matched_plan_meal: plan listesinden eşleşen |
+| "3 yumurta 2 dilim ekmek yedim" | log_food | somut tarif, plan yok |
+| "bugünkü programı uyguladım" | log_food | log_entire_plan: true |
+| "beslenme planımı sil" | delete_meal_plan | {} |
+| "bugün yediklerimi sil" | delete_food_log | days_ago: 0 |
+| "dün ne yemiştim" | query_history | days_ago: 1 |
+| "bench 3x8 60kg yaptım" | log_workout | sets listesi |
+| "programımı değiştir bacak günü ekle" | modify_workout_program | instruction |
+
 Not: Bir mesajda birden fazla şey olabilir (örn. hem yemek hem tercih) - sadece EN BASKIN
 intent'i seç, ama jarvis_reply içinde ikisini de yanıtlayabilirsin.
 """
@@ -211,14 +249,33 @@ MEAL_ALIASES = {
     "ara": ["ara ogun", "ara öğün", "atistirmalik", "atıştırmalık", "snack", "ikindi"],
 }
 
-# Tüm planı kaydetme ifadeleri (yedim/uyguladım vb. ile birlikte)
+# Tüm planı kaydetme ifadeleri — çoğul öğün, plan/program/menü ve günlük konuşma varyantları
 WHOLE_PLAN_RE = re.compile(
     r"(?:"
-    r"tum\s+(?:plan|menu|ogun|beslenme)|butun\s+(?:plan|menu|ogun)|hepsini\s+yedim|"
+    r"tum\s+(?:plan(?:im(?:i)?|a)?|menu(?:m(?:u)?)?|beslenme(?:\s+plan(?:im(?:i)?|a)?)?|"
+    r"ogun(?:ler(?:im(?:i)?|ini|i)?)?|yemek(?:ler(?:im(?:i)?|ini|i)?)?)|"
+    r"butun\s+(?:plan(?:im(?:i)?|a)?|menu(?:m(?:u)?)?|ogun(?:ler(?:im(?:i)?|ini|i)?)?|"
+    r"yemek(?:ler(?:im(?:i)?|ini|i)?)?|beslenme)|"
+    r"(?:ogun|yemek)lerim(?:i|in|in\s+hepsi|in\s+tamami)?|"
+    r"(?:hepsi|tamami|tumu)\s+(?:ogun|yemek|menu|plan)|"
+    r"hepsini\s+(?:yedim|aldim|bitirdim|tamamladim|uyguladim)|"
     r"(?:beslenme\s+)?(?:program|plan)(?:im|imi|a)?\s*(?:uygula|uyguladim|takip|yedim|bitirdim|tamamladim|aldim)|"
-    r"(?:bugunku|gunun)\s+(?:beslenme\s+)?(?:program|plan|menu)(?:im|imi|a)?|"
-    r"(?:program|plan|menu)(?:a|ima)?\s*(?:uygun|gore)\s*(?:yedim|aldim)|"
-    r"onerd(?:igin|iginiz)\s+(?:plan|menu)|jarvis(?:'?in|in)?\s+(?:plan|menu)"
+    r"(?:bugunku|gunun|bugunun)\s+(?:beslenme\s+)?(?:program|plan|menu)(?:im|imi|a)?|"
+    r"(?:program|plan|menu)(?:a|ima|im)?\s*(?:uygun|gore|dogru)\s*(?:yedim|aldim|uyguladim)|"
+    r"onerd(?:igin|iginiz)\s+(?:plan|menu|beslenme)|"
+    r"jarvis(?:'?in|in)?\s+(?:plan|menu|beslenme)|"
+    r"menu(?:yu|yu\s+)?(?:yedim|uyguladim|bitirdim|tamamladim)|"
+    r"plana?\s+(?:uygun|gore|sadik)\s*(?:yedim|kaldim|uyguladim)|"
+    r"(?:\d+|uc|dort|bes|alti)\s+ogun(?:un)?\s+(?:hepsi|tamami|tumu)"
+    r")",
+    re.IGNORECASE,
+)
+
+# Tek öğün sanılıp aslında tüm plan olan ifadeler (AI/kural hata önleme)
+WHOLE_PLAN_HINT_BLOCKLIST = re.compile(
+    r"(?:"
+    r"tum|butun|hepsi|tamami|tumu|ogunler|yemekler|menu|plan(?:im|a)?|program(?:im|a)?|"
+    r"beslenme|gunun|bugunku|onerdigin|onerilen"
     r")",
     re.IGNORECASE,
 )
@@ -273,8 +330,8 @@ def find_plan_meal(plan_items, query: str):
     return None
 
 
-def _extract_meal_hint_from_message(message: str) -> str | None:
-    """Mesajdan hangi öğüne atıf yapıldığını çıkarır."""
+def _extract_raw_meal_hint(message: str) -> str | None:
+    """Mesajdan olası tek öğün ipucunu çıkarır (tüm plan filtresi uygulanmaz)."""
     msg = _normalize_text(message)
 
     m = re.search(r"plan(?:im)?daki\s+(.+?)(?:\s+yedim|\s+aldim|\s+uyguladim|$)", msg)
@@ -293,18 +350,60 @@ def _extract_meal_hint_from_message(message: str) -> str | None:
     return None
 
 
+def _is_whole_plan_hint(hint: str) -> bool:
+    """Çıkarılan ipucunun aslında 'tüm plan' anlamına gelip gelmediğini kontrol eder."""
+    if not hint:
+        return False
+    h = _normalize_text(hint)
+    if WHOLE_PLAN_RE.search(h):
+        return True
+    if WHOLE_PLAN_HINT_BLOCKLIST.search(h) and not find_plan_meal_keyword(h):
+        return True
+    return False
+
+
+def find_plan_meal_keyword(hint: str) -> bool:
+    """İpucunda bilinen tek öğün alias'ı var mı."""
+    h = _normalize_text(hint)
+    for alias_key, aliases in MEAL_ALIASES.items():
+        terms = [_normalize_text(alias_key)] + [_normalize_text(a) for a in aliases]
+        if any(term in h for term in terms):
+            return True
+    return False
+
+
+def _extract_meal_hint_from_message(message: str) -> str | None:
+    """Mesajdan hangi TEK öğüne atıf yapıldığını çıkarır. Tüm plan ifadelerinde None döner."""
+    if _wants_whole_plan_log(message):
+        return None
+
+    hint = _extract_raw_meal_hint(message)
+    if hint and _is_whole_plan_hint(hint):
+        return None
+    return hint
+
+
 def _wants_whole_plan_log(message: str) -> bool:
     msg = _normalize_text(message)
     if WHOLE_PLAN_RE.search(msg):
         return True
-    # "bugunku beslenme programimi uyguladim" gibi ifadeler
+    if LOG_ACTION_RE.search(msg) and re.search(
+        r"(?:tum|butun|hepsi|tamami|tumu)\s*(?:ogun|yemek)|"
+        r"(?:ogun|yemek)lerim(?:i|in)?|"
+        r"hepsini\s+(?:ogun|yemek|menu)",
+        msg,
+    ):
+        return True
     if LOG_ACTION_RE.search(msg) and re.search(r"(?:beslenme\s+)?(?:program|plan|menu)", msg):
-        if not _extract_meal_hint_from_message(message):
+        hint = _extract_raw_meal_hint(message)
+        if not hint or _is_whole_plan_hint(hint):
             return True
     return False
 
 
 def _wants_plan_meal_log(message: str) -> bool:
+    if _wants_whole_plan_log(message):
+        return False
     msg = _normalize_text(message)
     if PLAN_REFERENCE_RE.search(msg):
         return True
@@ -390,6 +489,99 @@ def _plan_meals_list_reply(plan_items) -> dict:
     }
 
 
+def build_operational_context(db, conversation_history: list | None = None) -> str:
+    """AI'nin anlamlandırması için bugünkü durum + son konuşma bağlamını üretir."""
+    today = date.today()
+    meals_today = crud.get_nutrition_logs_by_date(db, today)
+    plan_items = crud.get_meal_plan(db)
+    workout_today = crud.get_workout_logs_by_date(db, today)
+
+    lines = [f"\nOPERASYONEL BAĞLAM (bugün: {today.strftime('%A %d.%m.%Y')}):"]
+
+    if plan_items:
+        plan_names = ", ".join(p.meal_name for p in plan_items)
+        plan_cal = sum(p.calories or 0 for p in plan_items)
+        lines.append(f"- Aktif beslenme planı ({len(plan_items)} öğün): {plan_names} (toplam ~{plan_cal:.0f} kcal)")
+    else:
+        lines.append("- Aktif beslenme planı YOK")
+
+    if meals_today:
+        logged_cal = sum(m.calories or 0 for m in meals_today)
+        logged_names = ", ".join(m.meal_name for m in meals_today)
+        lines.append(f"- Bugün kayıtlı öğünler ({len(meals_today)}): {logged_names} ({logged_cal:.0f} kcal)")
+    else:
+        lines.append("- Bugün henüz öğün kaydı YOK")
+
+    if workout_today:
+        lines.append(f"- Bugün {len(workout_today)} antrenman seti kayıtlı")
+
+    if conversation_history:
+        recent = conversation_history[-6:]
+        if recent:
+            lines.append("- Son konuşma:")
+            for turn in recent:
+                role = "Kullanıcı" if turn.get("role") == "user" else "Jarvis"
+                text = (turn.get("text") or "")[:200]
+                lines.append(f"  {role}: {text}")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def validate_and_correct_food_intent(user_message: str, data: dict, plan_items) -> dict:
+    """AI'nin sık yaptığı beslenme intent hatalarını kural tabanlı düzeltir."""
+    data = dict(data or {})
+
+    if _wants_whole_plan_log(user_message):
+        data["log_entire_plan"] = True
+        data["matched_plan_meal"] = None
+        return data
+
+    matched_name = data.get("matched_plan_meal")
+    if matched_name and _is_whole_plan_hint(str(matched_name)):
+        data["log_entire_plan"] = True
+        data["matched_plan_meal"] = None
+        return data
+
+    if matched_name and plan_items:
+        if not find_plan_meal(plan_items, matched_name):
+            hint = _extract_meal_hint_from_message(user_message)
+            if hint:
+                corrected = find_plan_meal(plan_items, hint)
+                if corrected:
+                    data["matched_plan_meal"] = corrected.meal_name
+
+    if not data.get("log_entire_plan") and not data.get("matched_plan_meal"):
+        hint = _extract_meal_hint_from_message(user_message)
+        if hint and plan_items:
+            matched = find_plan_meal(plan_items, hint)
+            if matched:
+                data["matched_plan_meal"] = matched.meal_name
+
+    return data
+
+
+def _format_user_prompt(user_message: str, conversation_history: list | None = None) -> str:
+    """Kullanıcı mesajını bağlamla birlikte modele iletir."""
+    if not conversation_history:
+        return user_message
+    recent = conversation_history[-4:]
+    if not recent:
+        return user_message
+    ctx_lines = []
+    for turn in recent:
+        if turn.get("role") == "user" and turn.get("text") == user_message:
+            continue
+        role = "Kullanıcı" if turn.get("role") == "user" else "Jarvis"
+        ctx_lines.append(f"{role}: {turn.get('text', '')[:300]}")
+    if not ctx_lines:
+        return user_message
+    return (
+        "Önceki konuşma:\n" + "\n".join(ctx_lines) +
+        f"\n\nŞimdiki mesaj:\n{user_message}"
+    )
+
+
 def try_resolve_plan_food_locally(user_message: str, db) -> dict | None:
     """AI'ye gitmeden plan tabanlı yemek kaydını çözmeye çalışır."""
     plan_items = crud.get_meal_plan(db)
@@ -425,7 +617,7 @@ def try_resolve_plan_food_locally(user_message: str, db) -> dict | None:
     return None
 
 
-def process_message(user_message: str, db=None) -> dict:
+def process_message(user_message: str, db=None, conversation_history: list | None = None) -> dict:
     """Tek giriş noktası: mesajı analiz eder, intent'e göre veritabanına yazar
     ve kullanıcıya verilecek yanıtı döndürür. Telegram botu ve ileride
     API/chat endpoint'i bu fonksiyonu kullanır."""
@@ -438,12 +630,14 @@ def process_message(user_message: str, db=None) -> dict:
         if local_food:
             return local_food
 
-        system_instruction = build_system_prompt(db) + INTENT_INSTRUCTIONS
+        operational_context = build_operational_context(db, conversation_history)
+        system_instruction = build_system_prompt(db) + operational_context + INTENT_INSTRUCTIONS
         model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=system_instruction)
 
+        prompt = _format_user_prompt(user_message, conversation_history)
         response = model.generate_content(
-            user_message,
-            generation_config={"response_mime_type": "application/json", "temperature": 0.4},
+            prompt,
+            generation_config={"response_mime_type": "application/json", "temperature": 0.25},
         )
         result = json.loads(response.text)
         intent = result.get("intent")
@@ -452,6 +646,7 @@ def process_message(user_message: str, db=None) -> dict:
         if intent == "log_food":
             import schemas
             plan_items = crud.get_meal_plan(db)
+            data = validate_and_correct_food_intent(user_message, data, plan_items)
 
             if data.get("log_entire_plan"):
                 if plan_items:
@@ -465,7 +660,6 @@ def process_message(user_message: str, db=None) -> dict:
                 if matched_meal_name:
                     matched = find_plan_meal(plan_items, matched_meal_name)
 
-                # AI öğün adını kaçırdıysa mesajdan tekrar dene
                 if not matched and plan_items:
                     hint = _extract_meal_hint_from_message(user_message)
                     if hint:
@@ -475,20 +669,22 @@ def process_message(user_message: str, db=None) -> dict:
                         matched = "__logged_all__"
 
                 if matched == "__logged_all__":
-                    pass  # result already updated
+                    pass
                 elif matched:
                     result.update(_log_plan_meal(db, matched))
                 elif matched_meal_name or _wants_plan_meal_log(user_message):
-                    if plan_items:
+                    if _wants_whole_plan_log(user_message) and plan_items:
+                        result.update(_log_all_plan_meals(db, plan_items))
+                    elif plan_items:
                         result["jarvis_reply"] = (
                             f"Planında '{matched_meal_name or 'bu öğün'}' bulamadım efendim. "
                             f"Mevcut öğünler: {', '.join(p.meal_name for p in plan_items)}.\n"
-                            f"Hangi öğünü yedin?"
+                            f"Hangi öğünü yedin? Veya tüm planı yediysen 'tüm öğünlerimi yedim' diyebilirsin."
                         )
+                        result["intent"] = "chat"
+                        result["_food_reply_is_final"] = True
                     else:
                         result.update(_no_plan_reply())
-                    result["intent"] = "chat"
-                    result["_food_reply_is_final"] = True
                 else:
                     calories = _safe_float(data.get("calories"), default=None)
                     description = data.get("description", "").strip()
