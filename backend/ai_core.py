@@ -996,10 +996,13 @@ SADECE aşağıdaki JSON formatında yanıt ver, başka hiçbir şey yazma:
             db.close()
 
 
-def analyze_photo(media_bytes: bytes, mime_type: str, db=None) -> dict:
+def analyze_photo(media_bytes: bytes, mime_type: str, db=None, save: bool = True) -> dict:
     """Telegram'a atılan bir FOTOĞRAFIN yemek mi yoksa fizik/vücut fotoğrafı mı olduğunu
     tek bir Gemini vision çağrısında ayırt edip uygun analizi yapar. Video için kullanılmaz
     (video her zaman form/fizik kabul edilir - bkz. analyze_physique_media).
+
+    save=False verilirse analiz sonucu döner ama veritabanına YAZMAZ — web arayüzünde
+    kullanıcının önce makroları onaylaması için kullanılır.
 
     Dönen dict:
     - photo_type: "food" | "physique" | "unclear"
@@ -1056,7 +1059,7 @@ SADECE aşağıdaki JSON formatında yanıt ver, başka hiçbir şey yazma:
         result = json.loads(response.text)
 
         photo_type = result.get("photo_type")
-        if photo_type == "food" and result.get("food"):
+        if save and photo_type == "food" and result.get("food"):
             food = result["food"]
             crud.create_nutrition_log(db, schemas.NutritionLogCreate(
                 meal_name=food.get("meal_name", "Öğün"),
@@ -1066,7 +1069,7 @@ SADECE aşağıdaki JSON formatında yanıt ver, başka hiçbir şey yazma:
                 carbs=_safe_float(food.get("carbs")),
                 fats=_safe_float(food.get("fats")),
             ))
-        elif photo_type == "physique" and result.get("physique"):
+        elif save and photo_type == "physique" and result.get("physique"):
             if result["physique"].get("memory_summary"):
                 crud.create_memory(db, category="physique_analysis", content=result["physique"]["memory_summary"])
 
