@@ -11,6 +11,10 @@ class UserProfile(Base):
     __tablename__ = "user_profile"
     id = Column(Integer, primary_key=True, index=True)
 
+    # Kimlik
+    name = Column(String, nullable=True)
+    started_at = Column(DateTime, nullable=True)  # Platformu kullanmaya başladığı tarih
+
     # Fiziksel bilgiler
     age = Column(Integer, nullable=True)
     height = Column(Float, nullable=True)

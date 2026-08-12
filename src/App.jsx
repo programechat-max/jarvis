@@ -6,6 +6,12 @@ import {
 
 const API_BASE = 'http://127.0.0.1:8000';
 
+const formatStartDate = (iso) => {
+  if (!iso) return null;
+  const d = new Date(iso);
+  return d.toLocaleDateString('tr-TR', { day: 'numeric', month: 'long', year: 'numeric' });
+};
+
 const DATA_MUTATING_INTENTS = new Set([
   'log_food', 'complete_all_meals', 'log_workout', 'log_weight',
   'remember', 'forget', 'modify_meal_plan', 'delete_meal_plan',
@@ -131,7 +137,7 @@ export default function DashboardMaster() {
   const fetchChartData = useCallback(async () => {
     setLoadingCharts(true);
     try {
-      const res = await fetch(`${API_BASE}/api/progress/charts?days=14`);
+      const res = await fetch(`${API_BASE}/api/progress/charts`);
       setChartData(await res.json());
     } catch (e) {
       console.error('Grafik verisi alınamadı:', e);
@@ -206,6 +212,50 @@ export default function DashboardMaster() {
     } catch (err) {
       console.error(err);
       setChatMessages((prev) => [...prev, { role: 'jarvis', text: 'Bağlantı hatası efendim, backend çalışıyor mu kontrol eder misiniz?' }]);
+    } finally {
+      setChatSending(false);
+    }
+  };
+
+  const sendChatMedia = async (file, mediaType) => {
+    if (!file || chatSending) return;
+    const previewUrl = (mediaType === 'photo' || mediaType === 'video') ? URL.createObjectURL(file) : null;
+    const userLabel = mediaType === 'voice' ? '🎤 Ses kaydı gönderildi' : mediaType === 'photo' ? '📷 Fotoğraf gönderildi' : '🎬 Video gönderildi';
+    setChatMessages((prev) => [...prev, { role: 'user', text: userLabel, mediaType, mediaPreviewUrl: previewUrl }]);
+    setChatSending(true);
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const endpoint = `${API_BASE}/api/chat/${mediaType}`;
+      const res = await fetch(endpoint, { method: 'POST', body: fd });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Medya gönderilemedi');
+      }
+      const data = await res.json();
+      if (data.transcript && mediaType === 'voice') {
+        setChatMessages((prev) => {
+          const updated = [...prev];
+          const lastUser = updated.findLastIndex((m) => m.role === 'user' && m.mediaType === 'voice');
+          if (lastUser >= 0) updated[lastUser] = { ...updated[lastUser], text: `🎤 "${data.transcript}"` };
+          return updated;
+        });
+      }
+      setChatMessages((prev) => [...prev, {
+        role: 'jarvis',
+        text: data.jarvis_reply,
+        intent: data.intent,
+        enriched: data.enriched,
+        trainingAdvice: data.training_advice,
+      }]);
+      if (DATA_MUTATING_INTENTS.has(data.intent)) {
+        fetchDashboardData();
+        if (activeTab === 'progress') fetchChartData();
+        fetchJarvisContext();
+      }
+    } catch (err) {
+      console.error(err);
+      setChatMessages((prev) => [...prev, { role: 'jarvis', text: err.message || 'Medya işlenirken hata oluştu efendim.' }]);
     } finally {
       setChatSending(false);
     }
@@ -398,9 +448,18 @@ export default function DashboardMaster() {
     <div className="min-h-screen bg-neutral-950 text-neutral-100 font-sans antialiased pb-12">
       <header className="border-b border-neutral-900 bg-neutral-900/50 backdrop-blur sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-4 py-4 flex justify-between items-center">
-          <div className="flex items-center gap-3">
-            <div className="h-3 w-3 bg-emerald-500 rounded-full animate-pulse"></div>
-            <span className="font-mono font-black tracking-widest text-lg">AI.COACH_OS</span>
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="h-3 w-3 bg-emerald-500 rounded-full animate-pulse shrink-0"></div>
+            <div className="min-w-0">
+              <p className="font-mono font-black tracking-widest text-lg truncate">
+                {profile?.name || 'AI.COACH_OS'}
+              </p>
+              {profile?.started_at && (
+                <p className="text-[10px] font-mono text-neutral-500 truncate">
+                  Başlangıç: {formatStartDate(profile.started_at)}
+                </p>
+              )}
+            </div>
           </div>
           <nav className="flex bg-neutral-950 p-1 rounded-xl border border-neutral-800">
             {[
@@ -432,7 +491,7 @@ export default function DashboardMaster() {
                 {profile?.goal ? `HEDEF: ${profile.goal.toUpperCase()}` : 'CANLI BAĞLANTI'}
               </span>
               <h2 className="text-2xl font-black mt-2">Sistem Canlı Veriye Bağlandı!</h2>
-              <p className="text-neutral-400 text-sm mt-1">Telegram'dan veya Jarvis sekmesinden gönderdiğin her rapor 10 saniyede bir buraya otomatik yansıyacak.</p>
+              <p className="text-neutral-400 text-sm mt-1">Jarvis sekmesinden yazabilir, ses kaydı veya fotoğraf/video gönderebilirsin — her rapor 10 saniyede bir buraya yansır.</p>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -465,6 +524,8 @@ export default function DashboardMaster() {
             onDeleteMemory={deleteMemory}
             onInputChange={setChatInput}
             onSubmit={sendChatMessage}
+            onSendMedia={sendChatMedia}
+            chatSending={chatSending}
             chatEndRef={chatEndRef}
           />
         )}
@@ -722,6 +783,7 @@ export default function DashboardMaster() {
               savingWeight={savingWeight}
               onWeightInputChange={setWeightInput}
               onSubmitWeight={submitWeight}
+              profile={profile}
             />
 
             <div className="bg-neutral-900 border border-neutral-800 p-6 rounded-2xl space-y-4">
@@ -806,7 +868,7 @@ function JarvisChatPanel({
   messages, input, sending, briefing, memories,
   showMemoryPanel, showCheckIn,
   onToggleMemory, onToggleCheckIn, onCheckInSubmit, onDeleteMemory,
-  onInputChange, onSubmit, chatEndRef,
+  onInputChange, onSubmit, onSendMedia, chatSending, chatEndRef,
 }) {
   const hints = [
     '3 yumurta yedim',
@@ -816,6 +878,50 @@ function JarvisChatPanel({
     'bu hafta vs geçen hafta',
     'bugün ne önerirsin?',
   ];
+
+  const photoInputRef = useRef(null);
+  const videoInputRef = useRef(null);
+  const [isRecordingVoice, setIsRecordingVoice] = useState(false);
+  const voiceRecorderRef = useRef(null);
+  const voiceChunksRef = useRef([]);
+  const voiceStreamRef = useRef(null);
+
+  const startVoiceRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      voiceStreamRef.current = stream;
+      voiceChunksRef.current = [];
+      const recorder = new MediaRecorder(stream);
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) voiceChunksRef.current.push(e.data); };
+      recorder.onstop = () => {
+        const blob = new Blob(voiceChunksRef.current, { type: 'audio/webm' });
+        onSendMedia(blob, 'voice');
+        stream.getTracks().forEach((t) => t.stop());
+      };
+      recorder.start();
+      voiceRecorderRef.current = recorder;
+      setIsRecordingVoice(true);
+    } catch {
+      alert('Mikrofon erişimi alınamadı. Tarayıcı izinlerini kontrol edin.');
+    }
+  };
+
+  const stopVoiceRecording = () => {
+    voiceRecorderRef.current?.stop();
+    setIsRecordingVoice(false);
+  };
+
+  const handlePhotoSelect = (e) => {
+    const file = e.target.files?.[0];
+    if (file) onSendMedia(file, 'photo');
+    e.target.value = '';
+  };
+
+  const handleVideoSelect = (e) => {
+    const file = e.target.files?.[0];
+    if (file) onSendMedia(file, 'video');
+    e.target.value = '';
+  };
 
   const CATEGORY_LABELS = {
     preference: 'Tercih',
@@ -890,6 +996,12 @@ function JarvisChatPanel({
                     ? 'bg-orange-500 text-black font-medium rounded-br-md'
                     : 'bg-neutral-950 border border-neutral-800 text-neutral-200 rounded-bl-md'
                 }`}>
+                  {msg.mediaPreviewUrl && msg.mediaType === 'photo' && (
+                    <img src={msg.mediaPreviewUrl} alt="Gönderilen fotoğraf" className="rounded-lg mb-2 max-h-40 object-cover w-full" />
+                  )}
+                  {msg.mediaPreviewUrl && msg.mediaType === 'video' && (
+                    <video src={msg.mediaPreviewUrl} controls className="rounded-lg mb-2 max-h-40 w-full" />
+                  )}
                   {msg.text}
                   {msg.role === 'jarvis' && (
                     <div className="flex flex-wrap gap-1.5 mt-2">
@@ -917,19 +1029,48 @@ function JarvisChatPanel({
             <div ref={chatEndRef} />
           </div>
 
-          <form onSubmit={onSubmit} className="p-4 border-t border-neutral-800 flex gap-2">
-            <input
-              type="text"
-              value={input}
-              onChange={(e) => onInputChange(e.target.value)}
-              placeholder="Örn: bugün çok yorgunum / neden squat önerdin? / 3 yumurta yedim"
-              disabled={sending}
-              className="flex-1 bg-neutral-950 border border-neutral-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-orange-500 disabled:opacity-50"
-            />
-            <button type="submit" disabled={sending || !input.trim()}
-              className="bg-orange-500 text-black font-bold px-5 py-3 rounded-xl text-sm disabled:opacity-40">
-              GÖNDER
-            </button>
+          <form onSubmit={onSubmit} className="p-4 border-t border-neutral-800 space-y-2">
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={input}
+                onChange={(e) => onInputChange(e.target.value)}
+                placeholder="Yaz, ses kaydı veya fotoğraf/video gönder..."
+                disabled={sending || chatSending}
+                className="flex-1 bg-neutral-950 border border-neutral-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-orange-500 disabled:opacity-50"
+              />
+              <button type="submit" disabled={sending || chatSending || !input.trim()}
+                className="bg-orange-500 text-black font-bold px-5 py-3 rounded-xl text-sm disabled:opacity-40">
+                GÖNDER
+              </button>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <input ref={photoInputRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={handlePhotoSelect} />
+              <input ref={videoInputRef} type="file" accept="video/*" capture="environment" className="hidden" onChange={handleVideoSelect} />
+              <button type="button" disabled={sending || chatSending || isRecordingVoice}
+                onClick={() => photoInputRef.current?.click()}
+                className="text-[10px] font-mono bg-neutral-950 border border-neutral-700 text-neutral-300 px-3 py-2 rounded-lg hover:border-orange-500/50 disabled:opacity-40">
+                📷 Fotoğraf
+              </button>
+              <button type="button" disabled={sending || chatSending || isRecordingVoice}
+                onClick={() => videoInputRef.current?.click()}
+                className="text-[10px] font-mono bg-neutral-950 border border-neutral-700 text-neutral-300 px-3 py-2 rounded-lg hover:border-orange-500/50 disabled:opacity-40">
+                🎬 Video
+              </button>
+              {!isRecordingVoice ? (
+                <button type="button" disabled={sending || chatSending}
+                  onClick={startVoiceRecording}
+                  className="text-[10px] font-mono bg-neutral-950 border border-neutral-700 text-neutral-300 px-3 py-2 rounded-lg hover:border-red-500/50 disabled:opacity-40">
+                  🎤 Ses Kaydı
+                </button>
+              ) : (
+                <button type="button" onClick={stopVoiceRecording}
+                  className="text-[10px] font-mono bg-red-600/20 border border-red-500/50 text-red-400 px-3 py-2 rounded-lg animate-pulse">
+                  ■ Kaydı Durdur
+                </button>
+              )}
+              <span className="text-[9px] font-mono text-neutral-600 ml-auto">Ses · Fotoğraf · Video desteklenir</span>
+            </div>
           </form>
         </div>
 
@@ -1065,12 +1206,17 @@ function FoodPhotoUpload({ preview, analyzing, error, inputRef, onFileSelect, on
   );
 }
 
-function ProgressChartsSection({ chartData, loading, metrics, weightDelta, weightInput, savingWeight, onWeightInputChange, onSubmitWeight }) {
+function ProgressChartsSection({ chartData, loading, metrics, weightDelta, weightInput, savingWeight, onWeightInputChange, onSubmitWeight, profile }) {
   const formatDate = (d) => {
     if (!d) return '';
     const parts = d.split('-');
     return parts.length >= 3 ? `${parts[2]}/${parts[1]}` : d;
   };
+
+  const periodDays = chartData?.period_days;
+  const periodLabel = periodDays
+    ? (profile?.started_at ? `Başlangıçtan itibaren (${periodDays} gün)` : `${periodDays} gün`)
+    : '14 gün';
 
   const nutritionChart = chartData?.nutrition?.map((d) => ({
     ...d,
@@ -1091,10 +1237,22 @@ function ProgressChartsSection({ chartData, loading, metrics, weightDelta, weigh
   }
 
   return (
+    <div className="space-y-4">
+      {profile?.started_at && (
+        <div className="bg-neutral-900/60 border border-neutral-800 rounded-xl px-4 py-3 flex flex-wrap items-center gap-3">
+          <span className="text-[10px] font-mono uppercase text-orange-400 tracking-wider">Gelişim Dönemi</span>
+          <span className="text-sm text-neutral-300">
+            {profile.name ? `${profile.name} — ` : ''}{formatStartDate(profile.started_at)} tarihinden bugüne
+          </span>
+          {periodDays != null && (
+            <span className="text-[10px] font-mono text-neutral-500 ml-auto">{periodDays} günlük veri</span>
+          )}
+        </div>
+      )}
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
       {/* Kilo trendi */}
       <div className="bg-neutral-900 border border-neutral-800 p-6 rounded-2xl space-y-4">
-        <h3 className="text-xs font-mono uppercase text-neutral-400 tracking-wider">Kilo Trendi (14 gün)</h3>
+        <h3 className="text-xs font-mono uppercase text-neutral-400 tracking-wider">Kilo Trendi ({periodLabel})</h3>
         {weightChart.length === 0 ? (
           <p className="text-sm text-neutral-600 font-mono">Henüz kilo kaydı yok.</p>
         ) : (
@@ -1179,6 +1337,7 @@ function ProgressChartsSection({ chartData, loading, metrics, weightDelta, weigh
           </ResponsiveContainer>
         )}
       </div>
+    </div>
     </div>
   );
 }
@@ -1377,6 +1536,7 @@ function MuscleHeatmap({ data }) {
 function OnboardingWizard({ onComplete }) {
   const [step, setStep] = useState(0);
   const [form, setForm] = useState({
+    name: '',
     age: '', height: '', current_weight: '', target_weight: '',
     goal: 'recomp', target_physique: '', experience_months: '',
     focus_muscle_group: '', activity_level: 'moderate',
@@ -1510,6 +1670,7 @@ function OnboardingWizard({ onComplete }) {
     setFinishError('');
     try {
       const payload = {
+        name: form.name.trim() || null,
         age: form.age ? parseInt(form.age, 10) : null,
         height: form.height ? parseFloat(form.height) : null,
         current_weight: form.current_weight ? parseFloat(form.current_weight) : null,
@@ -1561,7 +1722,13 @@ function OnboardingWizard({ onComplete }) {
 
           {step === 0 && (
             <div className="space-y-4">
-              <p className="text-sm text-neutral-300">Önce temel bilgilerini alalım efendim.</p>
+              <p className="text-sm text-neutral-300">Önce seni tanıyalım efendim — adını ve temel bilgilerini alalım.</p>
+              <label className="block space-y-1 text-xs">
+                <span className="text-orange-400 font-bold">Adın *</span>
+                <input type="text" value={form.name} onChange={(e) => updateForm('name', e.target.value)}
+                  placeholder="Örn: Yasemin"
+                  className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2.5 text-white focus:outline-none focus:border-orange-500" />
+              </label>
               <div className="grid grid-cols-2 gap-3 text-xs">
                 <label className="space-y-1">
                   <span className="text-neutral-500">Yaş</span>
@@ -1619,7 +1786,7 @@ function OnboardingWizard({ onComplete }) {
                     className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-white" />
                 </label>
               </div>
-              <button onClick={() => setStep(1)}
+              <button onClick={() => form.name.trim() ? setStep(1) : setMediaError('Lütfen adını gir efendim.')}
                 className="w-full bg-orange-500 text-black font-bold py-3 rounded-xl text-sm">
                 DEVAM ET →
               </button>

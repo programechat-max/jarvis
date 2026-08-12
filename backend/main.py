@@ -132,8 +132,13 @@ def onboarding_complete(data: schemas.UserProfileBase, db: Session = Depends(get
     UserMemory kayıtları + zenginleşmiş profil, build_system_prompt üzerinden otomatik
     olarak devreye girer - bu yüzden burada ekstra talimat geçmeye gerek yok, AI zaten
     kullanıcıyı 'tanıyarak' antrenman programını ve beslenme planını üretir."""
+    if not (data.name and data.name.strip()):
+        raise HTTPException(status_code=400, detail="İsim alanı zorunludur.")
     updates = data.model_dump(exclude_unset=True)
     updates["onboarding_completed"] = True
+    profile = crud.get_or_create_profile(db)
+    if not profile.started_at:
+        updates["started_at"] = dt.datetime.utcnow()
     profile = crud.update_profile(db, updates)
 
     # generate_workout_program zaten düz pydantic objeleri döner (bkz. fonksiyon içi not);
@@ -277,6 +282,114 @@ def clear_chat_history(session_id: str = "default", db: Session = Depends(get_db
     return {"deleted": deleted}
 
 
+MAX_CHAT_PHOTO_BYTES = 15 * 1024 * 1024
+MAX_CHAT_MEDIA_BYTES = 300 * 1024 * 1024
+
+
+def _chat_response_from_result(result: dict, media_type: str = None, transcript: str = None) -> schemas.ChatResponse:
+    return schemas.ChatResponse(
+        intent=result.get("intent", "chat"),
+        jarvis_reply=result.get("jarvis_reply", "Anlayamadım efendim, tekrar dener misiniz?"),
+        data=result.get("data") or {},
+        enriched=bool(result.get("_enriched")),
+        training_advice=result.get("data", {}).get("training_advice"),
+        media_type=media_type,
+        transcript=transcript,
+    )
+
+
+@app.post("/api/chat/voice", response_model=schemas.ChatResponse)
+async def chat_voice(
+    file: UploadFile = File(...),
+    session_id: str = "default",
+    db: Session = Depends(get_db),
+):
+    """Jarvis sohbetine ses kaydı gönder — transkribe edilip normal chat akışından işlenir."""
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Boş ses dosyası.")
+    if len(audio_bytes) > MAX_CHAT_MEDIA_BYTES:
+        raise HTTPException(status_code=413, detail="Ses kaydı çok büyük. Daha kısa bir kayıt dener misin?")
+    mime_type = file.content_type or "audio/webm"
+    transcript = ai_core.transcribe_audio(audio_bytes, mime_type)
+    if not transcript or transcript == "[ANLAŞILAMADI]":
+        raise HTTPException(status_code=400, detail="Ses kaydı anlaşılamadı. Daha net konuşup tekrar dener misin?")
+    result = ai_core.process_message(transcript, db, session_id=session_id)
+    return _chat_response_from_result(result, media_type="voice", transcript=transcript)
+
+
+@app.post("/api/chat/photo", response_model=schemas.ChatResponse)
+async def chat_photo(
+    file: UploadFile = File(...),
+    session_id: str = "default",
+    db: Session = Depends(get_db),
+):
+    """Jarvis sohbetine fotoğraf gönder — yemek veya fizik analizi yapılır."""
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Boş fotoğraf dosyası.")
+    if len(image_bytes) > MAX_CHAT_PHOTO_BYTES:
+        raise HTTPException(status_code=413, detail="Fotoğraf çok büyük (15MB üstü).")
+    mime_type = file.content_type or "image/jpeg"
+    crud.save_chat_message(db, "user", "📷 Fotoğraf gönderildi", session_id=session_id)
+
+    analysis = ai_core.analyze_photo(image_bytes, mime_type, db, save=True)
+    photo_type = analysis.get("photo_type")
+
+    if photo_type == "food" and analysis.get("food"):
+        food = analysis["food"]
+        jarvis_reply = (
+            f"✅ Fotoğraftan yemeği tanıdım efendim: {food.get('meal_name', 'Öğün')} — "
+            f"{food.get('calories', 0):.0f} kcal, {food.get('protein', 0):.0f}g protein. Kaydettim."
+        )
+        if food.get("confidence") == "low":
+            jarvis_reply += " (Makrolar tahmini — emin değilsen düzeltebilirsin.)"
+        intent = "log_food"
+    elif photo_type == "physique" and analysis.get("physique"):
+        jarvis_reply = analysis["physique"].get("report", "Fizik analizi tamamlandı efendim.")
+        intent = "coaching_advice"
+    elif analysis.get("clarify_message"):
+        jarvis_reply = analysis["clarify_message"]
+        intent = "chat"
+    else:
+        jarvis_reply = "Fotoğrafı analiz edemedim efendim. Daha net bir görüntü dener misin?"
+        intent = "chat"
+
+    crud.save_chat_message(db, "jarvis", jarvis_reply, intent=intent, session_id=session_id)
+    return schemas.ChatResponse(intent=intent, jarvis_reply=jarvis_reply, media_type="photo")
+
+
+@app.post("/api/chat/video", response_model=schemas.ChatResponse)
+async def chat_video(
+    file: UploadFile = File(...),
+    session_id: str = "default",
+    db: Session = Depends(get_db),
+):
+    """Jarvis sohbetine video gönder — fizik/form analizi yapılır."""
+    video_bytes = await file.read()
+    if not video_bytes:
+        raise HTTPException(status_code=400, detail="Boş video dosyası.")
+    if len(video_bytes) > MAX_CHAT_MEDIA_BYTES:
+        raise HTTPException(status_code=413, detail="Video çok büyük. 15-20 saniyelik kısa bir video dener misin?")
+    mime_type = file.content_type or "video/webm"
+    crud.save_chat_message(db, "user", "🎬 Video gönderildi", session_id=session_id)
+
+    try:
+        analysis = ai_core.analyze_physique_media(video_bytes, mime_type, db)
+        jarvis_reply = analysis.get("report", "Video analizi tamamlandı efendim.")
+        intent = "coaching_advice"
+        crud.save_chat_message(db, "jarvis", jarvis_reply, intent=intent, session_id=session_id)
+        return schemas.ChatResponse(
+            intent=intent,
+            jarvis_reply=jarvis_reply,
+            media_type="video",
+            training_advice=analysis.get("training_instruction"),
+        )
+    except Exception as e:
+        logger.error(f"[CHAT] Video analizi hatası: {e}")
+        raise HTTPException(status_code=500, detail=f"Video analiz edilemedi: {e}")
+
+
 @app.get("/api/jarvis/briefing")
 def get_jarvis_briefing(db: Session = Depends(get_db)):
     """Proaktif durum özeti — chat sekmesi açıldığında gösterilir."""
@@ -331,12 +444,20 @@ def delete_memory(memory_id: int, db: Session = Depends(get_db)):
 # GELİŞİM GRAFİKLERİ (birleşik veri)
 # ==========================================
 @app.get("/api/progress/charts")
-def get_progress_charts(days: int = 14, db: Session = Depends(get_db)):
-    """Dashboard gelişim sekmesi için birleşik grafik verisi."""
+def get_progress_charts(days: int = None, db: Session = Depends(get_db)):
+    """Dashboard gelişim sekmesi için birleşik grafik verisi.
+    Varsayılan olarak kullanıcının platforma başladığı günden bugüne kadar veri döner."""
     profile = crud.get_or_create_profile(db)
-    metrics = crud.get_body_metrics(db, days=days)
-    nutrition_history = crud.get_nutrition_history(db, days=days)
-    volume = crud.get_weekly_volume_by_muscle_group(db, days=days)
+
+    if profile.started_at:
+        start_date = profile.started_at.date() if hasattr(profile.started_at, 'date') else profile.started_at
+        period_days = max((date.today() - start_date).days, 1)
+    else:
+        period_days = days or 14
+
+    metrics = crud.get_body_metrics(db, days=period_days)
+    nutrition_history = crud.get_nutrition_history(db, days=period_days)
+    volume = crud.get_weekly_volume_by_muscle_group(db, days=period_days)
     meal_plan = crud.get_meal_plan(db)
 
     if meal_plan:
@@ -346,6 +467,8 @@ def get_progress_charts(days: int = 14, db: Session = Depends(get_db)):
         planned_cal = profile.daily_calorie_target or 2200
         planned_prot = profile.daily_protein_target or 140
 
+    started_at_iso = profile.started_at.isoformat() if profile.started_at else None
+
     return {
         "weight": [{"date": str(m.date), "weight": m.weight} for m in metrics if m.weight],
         "nutrition": nutrition_history,
@@ -354,6 +477,9 @@ def get_progress_charts(days: int = 14, db: Session = Depends(get_db)):
             "calories": planned_cal,
             "protein": planned_prot,
         },
+        "period_days": period_days,
+        "started_at": started_at_iso,
+        "user_name": profile.name,
     }
 
 

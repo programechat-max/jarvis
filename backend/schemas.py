@@ -4,6 +4,7 @@ from datetime import date, datetime
 
 # --- PROFİL ŞEMALARI ---
 class UserProfileBase(BaseModel):
+    name: Optional[str] = None
     age: Optional[int] = None
     height: Optional[float] = None
     current_weight: Optional[float] = None
@@ -24,6 +25,7 @@ class UserProfileBase(BaseModel):
 
 class UserProfileResponse(UserProfileBase):
     id: int
+    started_at: Optional[datetime] = None
     class Config:
         from_attributes = True
 
@@ -159,3 +161,6 @@ class ChatResponse(BaseModel):
     data: dict = {}
     enriched: bool = False
     training_advice: Optional[str] = None
+    media_type: Optional[str] = None
+    transcript: Optional[str] = None
+    preview_url: Optional[str] = None

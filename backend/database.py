@@ -24,7 +24,27 @@ def migrate_schema():
 
     Base.metadata.create_all(bind=engine)
     inspector = inspect(engine)
-    if "user_memory" not in inspector.get_table_names():
+    table_names = inspector.get_table_names()
+
+    if "user_profile" in table_names:
+        existing_profile = {col["name"] for col in inspector.get_columns("user_profile")}
+        profile_alters = []
+        if "name" not in existing_profile:
+            profile_alters.append("ALTER TABLE user_profile ADD COLUMN name VARCHAR")
+        if "started_at" not in existing_profile:
+            profile_alters.append("ALTER TABLE user_profile ADD COLUMN started_at DATETIME")
+        if profile_alters:
+            with engine.begin() as conn:
+                for stmt in profile_alters:
+                    conn.execute(text(stmt))
+                # Mevcut kullanıcılar için started_at = updated_at veya şimdi
+                conn.execute(text(
+                    "UPDATE user_profile SET started_at = COALESCE(updated_at, datetime('now')) "
+                    "WHERE started_at IS NULL"
+                ))
+            logger.info("user_profile şeması güncellendi (%d kolon)", len(profile_alters))
+
+    if "user_memory" not in table_names:
         return
     existing = {col["name"] for col in inspector.get_columns("user_memory")}
     alters = []
