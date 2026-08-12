@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+python-dotenv
+# Files API (video onboarding'de kullanılıyor) eski sürümlerde API-key-only kimlik
+# doğrulamasıyla güvenilir çalışmayabiliyor - en azından bu sürüm veya üstü önerilir.
+# Zaten kurulu eski bir sürüm varsa: pip install -r requirements.txt --upgrade
+google-generativeai>=0.8.3
+python-telegram-bot[job-queue]
+pytz
+python-multipart
