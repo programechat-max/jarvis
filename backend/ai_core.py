@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 import crud
 import schemas
 import progression
+import jarvis_brain
 from database import SessionLocal
 
 load_dotenv()
@@ -108,7 +109,7 @@ GÖREVİN: Kullanıcının mesajını analiz et ve SADECE aşağıdaki JSON form
 JSON dışında hiçbir şey yazma.
 
 {
-  "intent": "log_food" | "complete_all_meals" | "log_workout" | "log_weight" | "remember" | "forget" | "query_history" | "modify_meal_plan" | "delete_meal_plan" | "delete_food_log" | "modify_workout_program" | "delete_workout_program" | "chat",
+  "intent": "log_food" | "complete_all_meals" | "log_workout" | "log_weight" | "remember" | "forget" | "query_history" | "modify_meal_plan" | "delete_meal_plan" | "delete_food_log" | "modify_workout_program" | "delete_workout_program" | "explain_why" | "coaching_advice" | "daily_checkin" | "compare_period" | "chat",
   "data": {
     // log_food ise: "meal_name", "description", "calories", "protein", "carbs", "fats", "matched_plan_meal"
     //   KURAL 1 - Kullanıcı NE YEDİĞİNİ somut olarak tarif ettiyse (malzeme/miktar belirtmiş,
@@ -206,6 +207,24 @@ JSON dışında hiçbir şey yazma.
     //   KARIŞTIRMA - kullanıcı "yaptım" diyorsa log_workout, "program/plan yapsana/değiştir"
     //   diyorsa modify_workout_program. Kullanıcı programı SİLMEK istiyorsa bunu değil
     //   delete_workout_program kullan. jarvis_reply'i BOŞ BIRAK ("").
+
+    // explain_why ise: "topic" (kullanıcının "neden" sorduğu konu — örn. "bench seçimi", "protein hedefi", "deload")
+    //   BU INTENT'İ KULLAN: kullanıcı bir karar/program/hareket/hedef hakkında "neden", "niçin",
+    //   "neden bunu önerdin/seçtin" diye soruyorsa. jarvis_reply'i BOŞ BIRAK ("") — zenginleştirme katmanı dolduracak.
+
+    // coaching_advice ise: "topic" (genel koçluk konusu — beslenme, antrenman, toparlanma, motivasyon)
+    //   BU INTENT'İ KULLAN: kullanıcı genel tavsiye/öneri istiyorsa ("ne yapmalıyım", "bugün ne önerirsin",
+    //   "nasıl ilerlerim"). jarvis_reply'i BOŞ BIRAK ("").
+
+    // daily_checkin ise: "mood", "energy", "sleep_quality", "soreness" (her biri 1-5 int, belirtilmemişse null),
+    //   "notes" (serbest metin duygu durumu)
+    //   BU INTENT'İ KULLAN: kullanıcı bugün nasıl hissettiğini/enerjisini/uykusunu raporluyorsa
+    //   ("bugün çok yorgunum", "iyi uyudum", "kaslarım ağrıyor", "kendimi harika hissediyorum").
+    //   jarvis_reply'i BOŞ BIRAK ("") — kod hazırlık skorunu hesaplayacak.
+
+    // compare_period ise: "days" (int, varsayılan 7)
+    //   BU INTENT'İ KULLAN: kullanıcı dönem karşılaştırması istiyorsa ("bu hafta vs geçen hafta",
+    //   "son 7 günde nasıl gidiyorum", "gelişimim nasıl"). jarvis_reply'i BOŞ BIRAK ("").
   },
   "jarvis_reply": "Kullanıcıya Jarvis tonunda, kişiselleştirilmiş, kısa ve motive edici yanıt."
 }
@@ -232,15 +251,18 @@ def _safe_int(value, default=0):
     return int(_safe_float(value, default))
 
 
-def process_message(user_message: str, db=None) -> dict:
+def process_message(user_message: str, db=None, session_id: str = "default") -> dict:
     """Tek giriş noktası: mesajı analiz eder, intent'e göre veritabanına yazar
-    ve kullanıcıya verilecek yanıtı döndürür. Telegram botu ve ileride
-    API/chat endpoint'i bu fonksiyonu kullanır."""
+    ve kullanıcıya verilecek yanıtı döndürür. jarvis_brain katmanı ile zenginleştirilir."""
     own_session = db is None
     if own_session:
         db = SessionLocal()
     try:
-        system_instruction = build_system_prompt(db) + INTENT_INSTRUCTIONS
+        crud.save_chat_message(db, "user", user_message, session_id=session_id)
+
+        system_instruction = jarvis_brain.build_enhanced_system_prompt(
+            db, user_message, BASE_PERSONA, INTENT_INSTRUCTIONS
+        )
         model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=system_instruction)
 
         response = model.generate_content(
@@ -409,7 +431,34 @@ def process_message(user_message: str, db=None) -> dict:
                 sleep_hours=_safe_float(data.get("sleep_hours"), default=None) if data.get("sleep_hours") is not None else None,
             ))
         elif intent == "remember":
-            crud.create_memory(db, category=data.get("category", "preference"), content=data.get("content", user_message))
+            crud.create_memory(
+                db,
+                category=data.get("category", "preference"),
+                content=data.get("content", user_message),
+                importance=7,
+            )
+        elif intent == "explain_why":
+            result["_force_enrich"] = True
+            result["jarvis_reply"] = ""
+        elif intent == "coaching_advice":
+            result["_force_enrich"] = True
+            result["jarvis_reply"] = ""
+        elif intent == "daily_checkin":
+            mood = _safe_int(data.get("mood"), default=None) or 3
+            energy = _safe_int(data.get("energy"), default=None) or 3
+            sleep_q = _safe_int(data.get("sleep_quality"), default=None) or 3
+            soreness = _safe_int(data.get("soreness"), default=None) or 2
+            notes = data.get("notes") or user_message
+            checkin_result = jarvis_brain.process_checkin(db, mood, energy, sleep_q, soreness, notes)
+            result["jarvis_reply"] = checkin_result["jarvis_reply"]
+            result["data"]["checkin"] = checkin_result["checkin"]
+            result["data"]["training_advice"] = checkin_result["training_advice"]
+            result["_skip_enrich"] = True
+        elif intent == "compare_period":
+            days = _safe_int(data.get("days"), default=7) or 7
+            comparison = jarvis_brain.handle_compare_period(db, days=days)
+            result["jarvis_reply"] = comparison
+            result["_force_enrich"] = True
         elif intent == "query_history":
             days_ago = _safe_int(data.get("days_ago"), default=7)
             target_date = date.today() - timedelta(days=days_ago)
@@ -501,6 +550,27 @@ def process_message(user_message: str, db=None) -> dict:
                 result["jarvis_reply"] = "\n".join(lines)
             else:
                 result["jarvis_reply"] = "Programı güncellerken bir sorun oldu efendim, tekrar dener misin?"
+
+        # PR kutlaması — log_workout sonrası
+        if intent == "log_workout" and result.get("_new_prs"):
+            pr_msgs = []
+            for ex_name, weight, prev in result["_new_prs"]:
+                if prev > 0:
+                    pr_msgs.append(f"🏆 YENİ REKOR: {ex_name} — {weight}kg (önceki: {prev}kg)!")
+                else:
+                    pr_msgs.append(f"🏆 İlk kayıt: {ex_name} — {weight}kg!")
+            if pr_msgs and not result.get("_food_reply_is_final"):
+                base = (result.get("jarvis_reply") or "").strip()
+                result["jarvis_reply"] = (base + "\n" + "\n".join(pr_msgs)).strip() if base else "\n".join(pr_msgs)
+
+        # Koçluk zenginleştirmesi — ham API yanıtını güçlendirir
+        result = jarvis_brain.enrich_reply_with_coaching(db, user_message, result)
+
+        # Otomatik hafıza madenciliği
+        jarvis_brain.extract_implicit_memories(db, user_message, result.get("jarvis_reply", ""))
+
+        reply_text = result.get("jarvis_reply", "")
+        crud.save_chat_message(db, "jarvis", reply_text, intent=intent, session_id=session_id)
 
         return result
     except Exception as e:

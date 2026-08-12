@@ -1,7 +1,10 @@
 import datetime
-from sqlalchemy import create_engine
+import logging
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+
+logger = logging.getLogger(__name__)
 
 # SQLite Veritabanı Yolu
 SQLALCHEMY_DATABASE_URL = "sqlite:///./sql_app.db"
@@ -13,6 +16,33 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # Modellerin türeyeceği Base sınıfı
 Base = declarative_base()
+
+
+def migrate_schema():
+    """Mevcut SQLite DB'ye yeni kolonları güvenli şekilde ekler."""
+    import models  # noqa: F401 — tabloları register et
+
+    Base.metadata.create_all(bind=engine)
+    inspector = inspect(engine)
+    if "user_memory" not in inspector.get_table_names():
+        return
+    existing = {col["name"] for col in inspector.get_columns("user_memory")}
+    alters = []
+    if "importance" not in existing:
+        alters.append("ALTER TABLE user_memory ADD COLUMN importance INTEGER DEFAULT 5")
+    if "keywords" not in existing:
+        alters.append("ALTER TABLE user_memory ADD COLUMN keywords VARCHAR DEFAULT ''")
+    if "memory_key" not in existing:
+        alters.append("ALTER TABLE user_memory ADD COLUMN memory_key VARCHAR")
+    if "access_count" not in existing:
+        alters.append("ALTER TABLE user_memory ADD COLUMN access_count INTEGER DEFAULT 0")
+    if "updated_at" not in existing:
+        alters.append("ALTER TABLE user_memory ADD COLUMN updated_at DATETIME")
+    if alters:
+        with engine.begin() as conn:
+            for stmt in alters:
+                conn.execute(text(stmt))
+        logger.info("user_memory şeması güncellendi (%d kolon)", len(alters))
 
 
 def get_db():

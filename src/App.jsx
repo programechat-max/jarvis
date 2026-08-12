@@ -10,6 +10,7 @@ const DATA_MUTATING_INTENTS = new Set([
   'log_food', 'complete_all_meals', 'log_workout', 'log_weight',
   'remember', 'forget', 'modify_meal_plan', 'delete_meal_plan',
   'delete_food_log', 'modify_workout_program', 'delete_workout_program',
+  'daily_checkin',
 ]);
 
 const PROGRESSION_ICON = { increase_weight: '📈', hold_weight: '⏸️', add_reps: '➕', unknown_range: '❔' };
@@ -44,11 +45,13 @@ export default function DashboardMaster() {
   const [generatingProgram, setGeneratingProgram] = useState(false);
 
   // Sprint 1: Jarvis chat
-  const [chatMessages, setChatMessages] = useState([
-    { role: 'jarvis', text: 'Merhaba efendim. Beslenme, antrenman veya hedefleriniz hakkında bana yazabilirsiniz.' },
-  ]);
+  const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
   const [chatSending, setChatSending] = useState(false);
+  const [chatBriefing, setChatBriefing] = useState(null);
+  const [chatMemories, setChatMemories] = useState([]);
+  const [showMemoryPanel, setShowMemoryPanel] = useState(false);
+  const [showCheckIn, setShowCheckIn] = useState(false);
   const chatEndRef = useRef(null);
 
   // Sprint 1: Gelişim grafikleri
@@ -147,9 +150,35 @@ export default function DashboardMaster() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages]);
 
-  const sendChatMessage = async (e) => {
+  const fetchJarvisContext = useCallback(async () => {
+    try {
+      const [historyRes, briefingRes, memoryRes] = await Promise.all([
+        fetch(`${API_BASE}/api/chat/history?limit=40`),
+        fetch(`${API_BASE}/api/jarvis/briefing`),
+        fetch(`${API_BASE}/api/memory`),
+      ]);
+      const history = await historyRes.json();
+      if (history.length > 0) {
+        setChatMessages(history.map((m) => ({ role: m.role, text: m.text, intent: m.intent })));
+      } else {
+        setChatMessages([{ role: 'jarvis', text: 'Merhaba efendim. Beslenme, antrenman veya hedefleriniz hakkında bana yazabilirsiniz.' }]);
+      }
+      setChatBriefing(await briefingRes.json());
+      setChatMemories(await memoryRes.json());
+    } catch (e) {
+      console.error('Jarvis context yüklenemedi:', e);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'chat' && isSetupComplete) {
+      fetchJarvisContext();
+    }
+  }, [activeTab, isSetupComplete, fetchJarvisContext]);
+
+  const sendChatMessage = async (e, overrideText) => {
     e?.preventDefault();
-    const text = chatInput.trim();
+    const text = (overrideText ?? chatInput).trim();
     if (!text || chatSending) return;
     setChatInput('');
     setChatMessages((prev) => [...prev, { role: 'user', text }]);
@@ -162,10 +191,17 @@ export default function DashboardMaster() {
       });
       if (!res.ok) throw new Error('chat failed');
       const data = await res.json();
-      setChatMessages((prev) => [...prev, { role: 'jarvis', text: data.jarvis_reply, intent: data.intent }]);
+      setChatMessages((prev) => [...prev, {
+        role: 'jarvis',
+        text: data.jarvis_reply,
+        intent: data.intent,
+        enriched: data.enriched,
+        trainingAdvice: data.training_advice,
+      }]);
       if (DATA_MUTATING_INTENTS.has(data.intent)) {
         fetchDashboardData();
         if (activeTab === 'progress') fetchChartData();
+        fetchJarvisContext();
       }
     } catch (err) {
       console.error(err);
@@ -173,6 +209,27 @@ export default function DashboardMaster() {
     } finally {
       setChatSending(false);
     }
+  };
+
+  const submitCheckIn = async (values) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/jarvis/checkin`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(values),
+      });
+      const data = await res.json();
+      setChatMessages((prev) => [...prev, { role: 'jarvis', text: data.jarvis_reply, intent: 'daily_checkin' }]);
+      setShowCheckIn(false);
+      fetchJarvisContext();
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const deleteMemory = async (id) => {
+    await fetch(`${API_BASE}/api/memory/${id}`, { method: 'DELETE' });
+    fetchJarvisContext();
   };
 
   const analyzeFoodPhoto = async (file) => {
@@ -398,6 +455,14 @@ export default function DashboardMaster() {
             messages={chatMessages}
             input={chatInput}
             sending={chatSending}
+            briefing={chatBriefing}
+            memories={chatMemories}
+            showMemoryPanel={showMemoryPanel}
+            showCheckIn={showCheckIn}
+            onToggleMemory={() => setShowMemoryPanel((v) => !v)}
+            onToggleCheckIn={() => setShowCheckIn((v) => !v)}
+            onCheckInSubmit={submitCheckIn}
+            onDeleteMemory={deleteMemory}
             onInputChange={setChatInput}
             onSubmit={sendChatMessage}
             chatEndRef={chatEndRef}
@@ -737,67 +802,206 @@ const CHART_TOOLTIP_STYLE = {
   labelStyle: { color: '#a3a3a3' },
 };
 
-function JarvisChatPanel({ messages, input, sending, onInputChange, onSubmit, chatEndRef }) {
-  return (
-    <div className="space-y-4 animate-fadeIn max-w-3xl mx-auto">
-      <div className="bg-neutral-900 border border-neutral-800 rounded-2xl flex flex-col h-[calc(100vh-220px)] min-h-[420px]">
-        <div className="px-5 py-4 border-b border-neutral-800 flex items-center gap-3">
-          <span className="text-2xl">🤖</span>
-          <div>
-            <h2 className="font-black text-sm tracking-wide">JARVIS</h2>
-            <p className="text-[10px] font-mono text-neutral-500">Beslenme · Antrenman · Hedefler</p>
-          </div>
-          <span className="ml-auto text-[10px] font-mono text-emerald-500 bg-emerald-500/10 px-2 py-1 rounded-full border border-emerald-500/20">CANLI</span>
-        </div>
+function JarvisChatPanel({
+  messages, input, sending, briefing, memories,
+  showMemoryPanel, showCheckIn,
+  onToggleMemory, onToggleCheckIn, onCheckInSubmit, onDeleteMemory,
+  onInputChange, onSubmit, chatEndRef,
+}) {
+  const hints = [
+    '3 yumurta yedim',
+    'bench 80kg x 8',
+    'bugün çok yorgunum',
+    'neden bu programı seçtin?',
+    'bu hafta vs geçen hafta',
+    'bugün ne önerirsin?',
+  ];
 
-        <div className="flex-1 overflow-y-auto p-4 space-y-3">
-          {messages.map((msg, i) => (
-            <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-[85%] px-4 py-3 rounded-2xl text-sm leading-relaxed ${
-                msg.role === 'user'
-                  ? 'bg-orange-500 text-black font-medium rounded-br-md'
-                  : 'bg-neutral-950 border border-neutral-800 text-neutral-200 rounded-bl-md'
-              }`}>
-                {msg.text}
-                {msg.intent && msg.intent !== 'chat' && (
-                  <span className="block mt-1.5 text-[9px] font-mono opacity-60 uppercase">{msg.intent.replace(/_/g, ' ')}</span>
-                )}
-              </div>
+  const CATEGORY_LABELS = {
+    preference: 'Tercih',
+    note: 'Not',
+    insight: 'İçgörü',
+    analysis: 'Analiz',
+    physique_analysis: 'Fizik',
+    onboarding_voice: 'Onboarding',
+  };
+
+  return (
+    <div className="space-y-4 animate-fadeIn max-w-5xl mx-auto">
+      {/* Proaktif briefing kartı */}
+      {briefing && (
+        <div className="bg-gradient-to-r from-neutral-900 to-neutral-950 border border-orange-500/20 rounded-2xl p-4 space-y-3">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-[10px] font-mono uppercase text-orange-400 tracking-wider">Jarvis Durum Özeti</p>
+              <p className="text-sm text-neutral-200 mt-1 leading-relaxed">{briefing.briefing}</p>
             </div>
-          ))}
-          {sending && (
-            <div className="flex justify-start">
-              <div className="bg-neutral-950 border border-neutral-800 px-4 py-3 rounded-2xl rounded-bl-md text-sm text-neutral-500 font-mono animate-pulse">
-                Jarvis düşünüyor...
+            {briefing.readiness != null && (
+              <div className="text-center shrink-0 bg-neutral-950 border border-neutral-800 rounded-xl px-3 py-2">
+                <p className="text-[9px] font-mono text-neutral-500">HAZIRLIK</p>
+                <p className="text-lg font-black text-emerald-400">{Math.round(briefing.readiness)}</p>
               </div>
+            )}
+          </div>
+          {briefing.suggestions?.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {briefing.suggestions.map((s, i) => (
+                <button key={i} type="button" onClick={() => onSubmit(null, s)}
+                  className="text-[10px] font-mono bg-orange-500/10 border border-orange-500/30 text-orange-300 px-2.5 py-1.5 rounded-lg hover:bg-orange-500/20 transition-colors text-left">
+                  💡 {s}
+                </button>
+              ))}
             </div>
           )}
-          <div ref={chatEndRef} />
+        </div>
+      )}
+
+      <div className="flex gap-4 flex-col lg:flex-row">
+        {/* Ana sohbet */}
+        <div className="flex-1 bg-neutral-900 border border-neutral-800 rounded-2xl flex flex-col h-[calc(100vh-280px)] min-h-[420px]">
+          <div className="px-5 py-4 border-b border-neutral-800 flex items-center gap-3 flex-wrap">
+            <span className="text-2xl">🤖</span>
+            <div>
+              <h2 className="font-black text-sm tracking-wide">JARVIS AI</h2>
+              <p className="text-[10px] font-mono text-neutral-500">Hafıza · Canlı veri · Koçluk</p>
+            </div>
+            <div className="ml-auto flex gap-2">
+              <button type="button" onClick={onToggleCheckIn}
+                className="text-[10px] font-mono bg-neutral-950 border border-neutral-700 text-neutral-300 px-2.5 py-1.5 rounded-lg hover:border-orange-500/50">
+                ✓ Check-in
+              </button>
+              <button type="button" onClick={onToggleMemory}
+                className={`text-[10px] font-mono px-2.5 py-1.5 rounded-lg border ${showMemoryPanel ? 'bg-orange-500/20 border-orange-500/40 text-orange-300' : 'bg-neutral-950 border-neutral-700 text-neutral-300'}`}>
+                🧠 Hafıza ({memories?.length || 0})
+              </button>
+              <span className="text-[10px] font-mono text-emerald-500 bg-emerald-500/10 px-2 py-1.5 rounded-full border border-emerald-500/20">CANLI</span>
+            </div>
+          </div>
+
+          {showCheckIn && (
+            <CheckInForm onSubmit={onCheckInSubmit} onCancel={onToggleCheckIn} />
+          )}
+
+          <div className="flex-1 overflow-y-auto p-4 space-y-3">
+            {messages.map((msg, i) => (
+              <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                <div className={`max-w-[85%] px-4 py-3 rounded-2xl text-sm leading-relaxed ${
+                  msg.role === 'user'
+                    ? 'bg-orange-500 text-black font-medium rounded-br-md'
+                    : 'bg-neutral-950 border border-neutral-800 text-neutral-200 rounded-bl-md'
+                }`}>
+                  {msg.text}
+                  {msg.role === 'jarvis' && (
+                    <div className="flex flex-wrap gap-1.5 mt-2">
+                      {msg.intent && msg.intent !== 'chat' && (
+                        <span className="text-[9px] font-mono opacity-60 uppercase bg-neutral-900 px-1.5 py-0.5 rounded">{msg.intent.replace(/_/g, ' ')}</span>
+                      )}
+                      {msg.enriched && (
+                        <span className="text-[9px] font-mono text-emerald-500/80 bg-emerald-500/10 px-1.5 py-0.5 rounded">✦ zenginleştirildi</span>
+                      )}
+                      {msg.trainingAdvice && (
+                        <span className="text-[9px] font-mono text-blue-400/80 bg-blue-500/10 px-1.5 py-0.5 rounded">→ {msg.trainingAdvice}</span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+            {sending && (
+              <div className="flex justify-start">
+                <div className="bg-neutral-950 border border-neutral-800 px-4 py-3 rounded-2xl rounded-bl-md text-sm text-neutral-500 font-mono animate-pulse">
+                  Jarvis düşünüyor... (canlı veri + hafıza analizi)
+                </div>
+              </div>
+            )}
+            <div ref={chatEndRef} />
+          </div>
+
+          <form onSubmit={onSubmit} className="p-4 border-t border-neutral-800 flex gap-2">
+            <input
+              type="text"
+              value={input}
+              onChange={(e) => onInputChange(e.target.value)}
+              placeholder="Örn: bugün çok yorgunum / neden squat önerdin? / 3 yumurta yedim"
+              disabled={sending}
+              className="flex-1 bg-neutral-950 border border-neutral-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-orange-500 disabled:opacity-50"
+            />
+            <button type="submit" disabled={sending || !input.trim()}
+              className="bg-orange-500 text-black font-bold px-5 py-3 rounded-xl text-sm disabled:opacity-40">
+              GÖNDER
+            </button>
+          </form>
         </div>
 
-        <form onSubmit={onSubmit} className="p-4 border-t border-neutral-800 flex gap-2">
-          <input
-            type="text"
-            value={input}
-            onChange={(e) => onInputChange(e.target.value)}
-            placeholder="Örn: 3 yumurta yedim, bench 80kg x 8..."
-            disabled={sending}
-            className="flex-1 bg-neutral-950 border border-neutral-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-orange-500 disabled:opacity-50"
-          />
-          <button type="submit" disabled={sending || !input.trim()}
-            className="bg-orange-500 text-black font-bold px-5 py-3 rounded-xl text-sm disabled:opacity-40">
-            GÖNDER
-          </button>
-        </form>
+        {/* Hafıza paneli */}
+        {showMemoryPanel && (
+          <div className="lg:w-72 bg-neutral-900 border border-neutral-800 rounded-2xl p-4 h-[calc(100vh-280px)] min-h-[420px] flex flex-col">
+            <h3 className="text-xs font-mono uppercase text-neutral-400 tracking-wider mb-3">🧠 Jarvis Hafızası</h3>
+            <p className="text-[10px] text-neutral-600 mb-3">Senin hakkında biriktirdiği kalıcı bilgiler. Sohbetten otomatik de öğrenir.</p>
+            <div className="flex-1 overflow-y-auto space-y-2">
+              {(!memories || memories.length === 0) ? (
+                <p className="text-xs text-neutral-600 font-mono">Henüz hafıza kaydı yok.</p>
+              ) : memories.map((mem) => (
+                <div key={mem.id} className="bg-neutral-950 border border-neutral-800 rounded-xl p-3 group">
+                  <div className="flex items-center justify-between gap-1 mb-1">
+                    <span className="text-[9px] font-mono text-orange-400/80 uppercase">{CATEGORY_LABELS[mem.category] || mem.category}</span>
+                    <div className="flex items-center gap-1">
+                      <span className="text-[9px] text-neutral-600">{'★'.repeat(Math.min(5, Math.floor((mem.importance || 5) / 2)))}</span>
+                      <button type="button" onClick={() => onDeleteMemory(mem.id)}
+                        className="text-[9px] text-red-500/60 hover:text-red-400 opacity-0 group-hover:opacity-100">sil</button>
+                    </div>
+                  </div>
+                  <p className="text-[11px] text-neutral-300 leading-relaxed">{mem.content}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[10px] font-mono text-neutral-600">
-        {['3 yumurta yedim', 'bench 80kg x 8', 'kilo 78.5', 'dün ne yedim?'].map((hint) => (
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 text-[10px] font-mono text-neutral-600">
+        {hints.map((hint) => (
           <button key={hint} type="button" onClick={() => onInputChange(hint)}
             className="bg-neutral-900 border border-neutral-800 rounded-lg px-2 py-2 hover:border-neutral-600 hover:text-neutral-400 transition-colors text-left truncate">
             {hint}
           </button>
         ))}
+      </div>
+    </div>
+  );
+}
+
+function CheckInForm({ onSubmit, onCancel }) {
+  const [mood, setMood] = useState(3);
+  const [energy, setEnergy] = useState(3);
+  const [sleep, setSleep] = useState(3);
+  const [soreness, setSoreness] = useState(2);
+  const [notes, setNotes] = useState('');
+
+  const Slider = ({ label, value, onChange, low, high }) => (
+    <label className="block space-y-1">
+      <span className="text-[10px] font-mono text-neutral-500">{label}: {value}/5</span>
+      <input type="range" min="1" max="5" value={value} onChange={(e) => onChange(Number(e.target.value))}
+        className="w-full accent-orange-500" />
+      <div className="flex justify-between text-[9px] text-neutral-600"><span>{low}</span><span>{high}</span></div>
+    </label>
+  );
+
+  return (
+    <div className="px-4 py-3 border-b border-neutral-800 bg-neutral-950/50 space-y-3">
+      <p className="text-xs text-neutral-400">Bugün nasıl hissediyorsun efendim?</p>
+      <div className="grid grid-cols-2 gap-3">
+        <Slider label="Ruh hali" value={mood} onChange={setMood} low="Kötü" high="Harika" />
+        <Slider label="Enerji" value={energy} onChange={setEnergy} low="Bitkin" high="Zirve" />
+        <Slider label="Uyku kalitesi" value={sleep} onChange={setSleep} low="Kötü" high="Mükemmel" />
+        <Slider label="Kas ağrısı" value={soreness} onChange={setSoreness} low="Yok" high="Çok" />
+      </div>
+      <input type="text" value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Ek not (opsiyonel)"
+        className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-xs" />
+      <div className="flex gap-2">
+        <button type="button" onClick={onCancel} className="flex-1 text-xs py-2 bg-neutral-800 rounded-lg">İptal</button>
+        <button type="button" onClick={() => onSubmit({ mood, energy, sleep_quality: sleep, soreness, notes })}
+          className="flex-1 text-xs py-2 bg-orange-500 text-black font-bold rounded-lg">Kaydet & Analiz Et</button>
       </div>
     </div>
   );

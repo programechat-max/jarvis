@@ -265,13 +265,27 @@ def _normalize_memory_text(text: str) -> str:
     return " ".join((text or "").strip().lower().split())
 
 
-def create_memory(db: Session, category: str, content: str):
-    """Yeni bir hafıza kaydı ekler. Basit ama etkili bir tekrar-önleme uygular: aynı
-    kategoride, normalize edilmiş metni neredeyse birebir aynı olan bir kayıt zaten
-    varsa, yeni bir satır daha eklemek yerine mevcut kaydı GÜNCELLER (içerik + tarih).
-    Bu sayede "balık yemem" gibi bir tercih kullanıcı tarafından farklı sohbetlerde
-    tekrar tekrar söylense bile hafızada onlarca neredeyse aynı satır birikmez."""
+def create_memory(db: Session, category: str, content: str, importance: int = 5, keywords: str = "", memory_key: str = None):
+    """Yeni bir hafıza kaydı ekler. memory_key varsa aynı anahtardaki kaydı günceller."""
     normalized_new = _normalize_memory_text(content)
+
+    if memory_key:
+        existing_by_key = (
+            db.query(models.UserMemory)
+            .filter(models.UserMemory.memory_key == memory_key)
+            .first()
+        )
+        if existing_by_key:
+            existing_by_key.content = content
+            existing_by_key.category = category
+            existing_by_key.importance = max(existing_by_key.importance or 5, importance)
+            if keywords:
+                existing_by_key.keywords = keywords
+            existing_by_key.updated_at = datetime.datetime.utcnow()
+            db.commit()
+            db.refresh(existing_by_key)
+            return existing_by_key
+
     existing = (
         db.query(models.UserMemory)
         .filter(models.UserMemory.category == category)
@@ -285,17 +299,27 @@ def create_memory(db: Session, category: str, content: str):
             continue
         if normalized_existing == normalized_new or normalized_existing in normalized_new or normalized_new in normalized_existing:
             mem.content = content
-            mem.created_at = datetime.datetime.utcnow()
+            mem.importance = max(mem.importance or 5, importance)
+            if keywords:
+                mem.keywords = keywords
+            if memory_key:
+                mem.memory_key = memory_key
+            mem.updated_at = datetime.datetime.utcnow()
             db.commit()
             db.refresh(mem)
             return mem
 
-    db_mem = models.UserMemory(category=category, content=content)
+    db_mem = models.UserMemory(
+        category=category,
+        content=content,
+        importance=importance,
+        keywords=keywords or "",
+        memory_key=memory_key,
+    )
     db.add(db_mem)
     db.commit()
     db.refresh(db_mem)
 
-    # "analysis" kategorisi kendi başına şişip diğer hafızayı ittirmesin diye budanıyor.
     if category == "analysis":
         old_analyses = (
             db.query(models.UserMemory)
@@ -344,10 +368,7 @@ def forget_memory(db: Session, content_hint: str):
 
 
 def get_recent_memories(db: Session, limit: int = MAX_DURABLE_MEMORIES):
-    """Hafızayı iki katmanlı çeker: (1) en güncel en fazla MAX_ANALYSIS_MEMORIES adet
-    haftalık analiz raporu, (2) preference/insight/note gibi kalıcı, kısa kayıtlardan en
-    fazla `limit` adet. Bu ayrım olmadan (eskiden: tek sorguda son 10 kayıt) uzun analiz
-    metinleri kısa ama önemli tercihleri hafıza penceresinden kolayca dışarı itiyordu."""
+    """Hafızayı iki katmanlı çeker."""
     analyses = (
         db.query(models.UserMemory)
         .filter(models.UserMemory.category == "analysis")
@@ -362,8 +383,134 @@ def get_recent_memories(db: Session, limit: int = MAX_DURABLE_MEMORIES):
         .limit(limit)
         .all()
     )
-    # Kronolojik sırada (eskiden yeniye) döndür ki sistem prompt'ta okunması daha doğal olsun.
     return list(reversed(durable)) + list(reversed(analyses))
+
+
+def get_all_memories(db: Session, category: str = None):
+    q = db.query(models.UserMemory).order_by(models.UserMemory.importance.desc(), models.UserMemory.id.desc())
+    if category:
+        q = q.filter(models.UserMemory.category == category)
+    return q.all()
+
+
+def update_memory(db: Session, memory_id: int, content: str = None, category: str = None, importance: int = None):
+    mem = db.query(models.UserMemory).filter(models.UserMemory.id == memory_id).first()
+    if not mem:
+        return None
+    if content is not None:
+        mem.content = content
+    if category is not None:
+        mem.category = category
+    if importance is not None:
+        mem.importance = importance
+    mem.updated_at = datetime.datetime.utcnow()
+    db.commit()
+    db.refresh(mem)
+    return mem
+
+
+def delete_memory(db: Session, memory_id: int):
+    mem = db.query(models.UserMemory).filter(models.UserMemory.id == memory_id).first()
+    if mem:
+        db.delete(mem)
+        db.commit()
+        return True
+    return False
+
+
+def search_memories(db: Session, query: str, limit: int = 20):
+    """Basit anahtar kelime araması — hafıza paneli için."""
+    words = [w for w in _normalize_memory_text(query).split() if len(w) > 2]
+    if not words:
+        return get_all_memories(db)[:limit]
+    all_mem = db.query(models.UserMemory).all()
+    scored = []
+    for mem in all_mem:
+        text = _normalize_memory_text(f"{mem.content} {mem.keywords or ''}")
+        score = sum(1 for w in words if w in text)
+        score += (mem.importance or 5) * 0.1
+        if score > 0:
+            scored.append((score, mem))
+    scored.sort(key=lambda x: -x[0])
+    return [m for _, m in scored[:limit]]
+
+
+def touch_memory_access(db: Session, memory_ids: list):
+    if not memory_ids:
+        return
+    db.query(models.UserMemory).filter(models.UserMemory.id.in_(memory_ids)).update(
+        {models.UserMemory.access_count: models.UserMemory.access_count + 1},
+        synchronize_session=False,
+    )
+    db.commit()
+
+
+# ==========================================
+# 6. SOHBET GEÇMİŞİ
+# ==========================================
+def save_chat_message(db: Session, role: str, content: str, intent: str = None, session_id: str = "default"):
+    msg = models.ChatMessage(role=role, content=content, intent=intent, session_id=session_id)
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+    _trim_chat_history(db, session_id)
+    return msg
+
+
+def _trim_chat_history(db: Session, session_id: str, keep: int = 100):
+    ids = (
+        db.query(models.ChatMessage.id)
+        .filter(models.ChatMessage.session_id == session_id)
+        .order_by(models.ChatMessage.id.desc())
+        .offset(keep)
+        .all()
+    )
+    if ids:
+        db.query(models.ChatMessage).filter(models.ChatMessage.id.in_([i[0] for i in ids])).delete(synchronize_session=False)
+        db.commit()
+
+
+def get_chat_history(db: Session, session_id: str = "default", limit: int = 30):
+    rows = (
+        db.query(models.ChatMessage)
+        .filter(models.ChatMessage.session_id == session_id)
+        .order_by(models.ChatMessage.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return list(reversed(rows))
+
+
+def clear_chat_history(db: Session, session_id: str = "default"):
+    deleted = db.query(models.ChatMessage).filter(models.ChatMessage.session_id == session_id).delete()
+    db.commit()
+    return deleted
+
+
+# ==========================================
+# 7. GÜNLÜK CHECK-IN
+# ==========================================
+def upsert_daily_checkin(db: Session, data: dict):
+    today = date.today()
+    checkin = db.query(models.DailyCheckIn).filter(models.DailyCheckIn.date == today).first()
+    if not checkin:
+        checkin = models.DailyCheckIn(date=today)
+        db.add(checkin)
+    for key, val in data.items():
+        if val is not None and hasattr(checkin, key):
+            setattr(checkin, key, val)
+    db.commit()
+    db.refresh(checkin)
+    return checkin
+
+
+def get_today_checkin(db: Session):
+    return db.query(models.DailyCheckIn).filter(models.DailyCheckIn.date == date.today()).first()
+
+
+def get_checkin_history(db: Session, days: int = 14):
+    start = date.today() - timedelta(days=days)
+    return db.query(models.DailyCheckIn).filter(models.DailyCheckIn.date >= start).order_by(models.DailyCheckIn.date).all()
 
 
 # ==========================================

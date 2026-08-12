@@ -105,12 +105,30 @@ class BodyMetricResponse(BodyMetricCreate):
 class UserMemoryCreate(BaseModel):
     category: str = "note"
     content: str
+    importance: Optional[int] = 5
+
+class UserMemoryUpdate(BaseModel):
+    content: Optional[str] = None
+    category: Optional[str] = None
+    importance: Optional[int] = None
 
 class UserMemoryResponse(UserMemoryCreate):
     id: int
     created_at: datetime
+    updated_at: Optional[datetime] = None
+    keywords: Optional[str] = ""
+    memory_key: Optional[str] = None
+    access_count: Optional[int] = 0
     class Config:
         from_attributes = True
+
+
+class CheckInRequest(BaseModel):
+    mood: int = 3
+    energy: int = 3
+    sleep_quality: int = 3
+    soreness: int = 2
+    notes: Optional[str] = None
 
 
 # --- ÖĞÜN PLANI ŞEMALARI (AI önerisi) ---
@@ -133,8 +151,11 @@ class MealPlanItemResponse(MealPlanItemCreate):
 # --- SOHBET ŞEMALARI ---
 class ChatRequest(BaseModel):
     message: str
+    session_id: Optional[str] = "default"
 
 class ChatResponse(BaseModel):
     intent: str
     jarvis_reply: str
     data: dict = {}
+    enriched: bool = False
+    training_advice: Optional[str] = None
