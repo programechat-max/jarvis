@@ -1,6 +1,16 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip,
+  ResponsiveContainer, ReferenceLine, CartesianGrid,
+} from 'recharts';
 
 const API_BASE = 'http://127.0.0.1:8000';
+
+const DATA_MUTATING_INTENTS = new Set([
+  'log_food', 'complete_all_meals', 'log_workout', 'log_weight',
+  'remember', 'forget', 'modify_meal_plan', 'delete_meal_plan',
+  'delete_food_log', 'modify_workout_program', 'delete_workout_program',
+]);
 
 const PROGRESSION_ICON = { increase_weight: '📈', hold_weight: '⏸️', add_reps: '➕', unknown_range: '❔' };
 const PROGRESSION_COLOR = {
@@ -32,6 +42,24 @@ export default function DashboardMaster() {
   const [loadingDaily, setLoadingDaily] = useState(false);
   const [generatingPlan, setGeneratingPlan] = useState(false);
   const [generatingProgram, setGeneratingProgram] = useState(false);
+
+  // Sprint 1: Jarvis chat
+  const [chatMessages, setChatMessages] = useState([
+    { role: 'jarvis', text: 'Merhaba efendim. Beslenme, antrenman veya hedefleriniz hakkında bana yazabilirsiniz.' },
+  ]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatSending, setChatSending] = useState(false);
+  const chatEndRef = useRef(null);
+
+  // Sprint 1: Gelişim grafikleri
+  const [chartData, setChartData] = useState(null);
+  const [loadingCharts, setLoadingCharts] = useState(false);
+
+  // Sprint 1: Yemek fotoğrafı
+  const [foodPhotoPreview, setFoodPhotoPreview] = useState(null);
+  const [foodPhotoAnalyzing, setFoodPhotoAnalyzing] = useState(false);
+  const [foodPhotoError, setFoodPhotoError] = useState('');
+  const foodPhotoInputRef = useRef(null);
 
   // ==========================================
   // BACKEND'DEN VERİLERİ ÇEKEN MOTOR
@@ -97,6 +125,107 @@ export default function DashboardMaster() {
     }
   }, [activeTab, selectedDate, fetchDailyWindow]);
 
+  const fetchChartData = useCallback(async () => {
+    setLoadingCharts(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/progress/charts?days=14`);
+      setChartData(await res.json());
+    } catch (e) {
+      console.error('Grafik verisi alınamadı:', e);
+    } finally {
+      setLoadingCharts(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'progress') {
+      fetchChartData();
+    }
+  }, [activeTab, fetchChartData]);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatMessages]);
+
+  const sendChatMessage = async (e) => {
+    e?.preventDefault();
+    const text = chatInput.trim();
+    if (!text || chatSending) return;
+    setChatInput('');
+    setChatMessages((prev) => [...prev, { role: 'user', text }]);
+    setChatSending(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: text }),
+      });
+      if (!res.ok) throw new Error('chat failed');
+      const data = await res.json();
+      setChatMessages((prev) => [...prev, { role: 'jarvis', text: data.jarvis_reply, intent: data.intent }]);
+      if (DATA_MUTATING_INTENTS.has(data.intent)) {
+        fetchDashboardData();
+        if (activeTab === 'progress') fetchChartData();
+      }
+    } catch (err) {
+      console.error(err);
+      setChatMessages((prev) => [...prev, { role: 'jarvis', text: 'Bağlantı hatası efendim, backend çalışıyor mu kontrol eder misiniz?' }]);
+    } finally {
+      setChatSending(false);
+    }
+  };
+
+  const analyzeFoodPhoto = async (file) => {
+    if (!file) return;
+    setFoodPhotoError('');
+    setFoodPhotoAnalyzing(true);
+    setFoodPhotoPreview(null);
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const res = await fetch(`${API_BASE}/api/nutrition/photo`, { method: 'POST', body: fd });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Analiz başarısız');
+      }
+      const result = await res.json();
+      if (result.photo_type === 'food' && result.food) {
+        setFoodPhotoPreview({ ...result.food, previewUrl: URL.createObjectURL(file) });
+      } else if (result.photo_type === 'physique' && result.physique) {
+        setFoodPhotoError('Bu bir yemek fotoğrafı değil — vücut/fizik fotoğrafı algılandı. Yemek tabağının fotoğrafını yükleyin.');
+      } else {
+        setFoodPhotoError(result.clarify_message || 'Yemek tanımlanamadı, daha net bir fotoğraf dener misiniz?');
+      }
+    } catch (err) {
+      setFoodPhotoError(err.message || 'Fotoğraf analiz edilemedi.');
+    } finally {
+      setFoodPhotoAnalyzing(false);
+    }
+  };
+
+  const confirmFoodPhoto = async () => {
+    if (!foodPhotoPreview) return;
+    try {
+      await fetch(`${API_BASE}/api/nutrition/photo/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          meal_name: foodPhotoPreview.meal_name || 'Öğün',
+          ingredients: foodPhotoPreview.description || '',
+          calories: foodPhotoPreview.calories || 0,
+          protein: foodPhotoPreview.protein || 0,
+          carbs: foodPhotoPreview.carbs || 0,
+          fats: foodPhotoPreview.fats || 0,
+        }),
+      });
+      setFoodPhotoPreview(null);
+      fetchDashboardData();
+    } catch (e) {
+      console.error(e);
+      setFoodPhotoError('Kayıt sırasında hata oluştu.');
+    }
+  };
+
   const shiftSelectedDate = (deltaDays) => {
     const d = new Date(selectedDate);
     d.setDate(d.getDate() + deltaDays);
@@ -129,6 +258,7 @@ export default function DashboardMaster() {
       setWeightInput('');
       const res = await fetch(`${API_BASE}/api/metrics?days=30`);
       setMetrics(await res.json());
+      fetchChartData();
     } catch (e) {
       console.error(e);
     } finally {
@@ -218,6 +348,7 @@ export default function DashboardMaster() {
           <nav className="flex bg-neutral-950 p-1 rounded-xl border border-neutral-800">
             {[
               ['flow', 'AKIŞ'],
+              ['chat', 'JARVIS'],
               ['daily', 'GÜNLÜK'],
               ['workout', 'ANTRENMAN'],
               ['nutrition', 'MUTFAK'],
@@ -244,7 +375,7 @@ export default function DashboardMaster() {
                 {profile?.goal ? `HEDEF: ${profile.goal.toUpperCase()}` : 'CANLI BAĞLANTI'}
               </span>
               <h2 className="text-2xl font-black mt-2">Sistem Canlı Veriye Bağlandı!</h2>
-              <p className="text-neutral-400 text-sm mt-1">Telegram'dan gönderdiğin her rapor 10 saniyede bir buraya otomatik yansıyacak şampiyon.</p>
+              <p className="text-neutral-400 text-sm mt-1">Telegram'dan veya Jarvis sekmesinden gönderdiğin her rapor 10 saniyede bir buraya otomatik yansıyacak.</p>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -260,6 +391,17 @@ export default function DashboardMaster() {
               </div>
             )}
           </div>
+        )}
+
+        {activeTab === 'chat' && (
+          <JarvisChatPanel
+            messages={chatMessages}
+            input={chatInput}
+            sending={chatSending}
+            onInputChange={setChatInput}
+            onSubmit={sendChatMessage}
+            chatEndRef={chatEndRef}
+          />
         )}
 
         {activeTab === 'daily' && (
@@ -409,6 +551,16 @@ export default function DashboardMaster() {
           <div className="space-y-6 animate-fadeIn">
             <h2 className="text-xl font-black font-mono tracking-tight text-emerald-500">// ANABOLİK MUTFAK VE MAKROLAR</h2>
 
+            <FoodPhotoUpload
+              preview={foodPhotoPreview}
+              analyzing={foodPhotoAnalyzing}
+              error={foodPhotoError}
+              inputRef={foodPhotoInputRef}
+              onFileSelect={analyzeFoodPhoto}
+              onConfirm={confirmFoodPhoto}
+              onCancel={() => { setFoodPhotoPreview(null); setFoodPhotoError(''); }}
+            />
+
             <div className="bg-neutral-900 border border-neutral-800 p-6 rounded-2xl space-y-4">
               <div className="flex justify-between items-center">
                 <h3 className="text-xs font-mono uppercase text-neutral-400 tracking-wider">📋 Jarvis'in Önerdiği Plan (Henüz Yenmedi)</h3>
@@ -496,55 +648,37 @@ export default function DashboardMaster() {
           <div className="space-y-6 animate-fadeIn">
             <h2 className="text-xl font-black font-mono tracking-tight text-orange-500">// GELİŞİM VE ANALİZ</h2>
 
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-              <div className="bg-neutral-900 border border-neutral-800 p-6 rounded-2xl space-y-4">
-                <h3 className="text-xs font-mono uppercase text-neutral-400 tracking-wider">Kilo Trendi</h3>
-                {metrics.filter(m => m.weight).length === 0 ? (
-                  <p className="text-sm text-neutral-600 font-mono">Henüz ölçüm yok.</p>
-                ) : (
-                  <>
-                    <WeightSparkline metrics={metrics} />
-                    {weightDelta !== null && (
-                      <p className="text-xs font-mono text-neutral-400">
-                        30 günde değişim: <span className={weightDelta <= 0 ? 'text-emerald-400' : 'text-orange-400'}>{weightDelta > 0 ? '+' : ''}{weightDelta.toFixed(1)} kg</span>
-                      </p>
-                    )}
-                  </>
-                )}
-                <form onSubmit={submitWeight} className="flex gap-2 pt-2">
-                  <input
-                    type="number" step="0.1" placeholder="kg" value={weightInput}
-                    onChange={(e) => setWeightInput(e.target.value)}
-                    className="flex-1 bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-orange-500"
-                  />
-                  <button type="submit" disabled={savingWeight}
-                    className="bg-orange-500 text-black text-xs font-bold px-4 py-2 rounded-lg disabled:opacity-50">
-                    {savingWeight ? '...' : 'KAYDET'}
-                  </button>
-                </form>
-              </div>
+            <ProgressChartsSection
+              chartData={chartData}
+              loading={loadingCharts}
+              metrics={metrics}
+              weightDelta={weightDelta}
+              weightInput={weightInput}
+              savingWeight={savingWeight}
+              onWeightInputChange={setWeightInput}
+              onSubmitWeight={submitWeight}
+            />
 
-              <div className="lg:col-span-2 bg-neutral-900 border border-neutral-800 p-6 rounded-2xl space-y-4">
-                <div className="flex justify-between items-center">
-                  <h3 className="text-xs font-mono uppercase text-neutral-400 tracking-wider">Jarvis'in Analizleri</h3>
-                  <button onClick={runWeeklyAnalysis} disabled={analyzing}
-                    className="bg-emerald-500 text-black text-xs font-bold px-4 py-2 rounded-lg disabled:opacity-50">
-                    {analyzing ? 'ANALİZ EDİLİYOR...' : 'ŞİMDİ ANALİZ ET'}
-                  </button>
-                </div>
-                {insights.length === 0 ? (
-                  <p className="text-sm text-neutral-600 font-mono">Henüz kayıtlı içgörü yok. Bir hafta veri girdikten sonra "Şimdi Analiz Et" butonuna bas.</p>
-                ) : (
-                  <div className="space-y-3 max-h-96 overflow-y-auto pr-2">
-                    {insights.map((ins) => (
-                      <div key={ins.id} className="p-4 bg-neutral-950 border border-neutral-800 rounded-xl">
-                        <span className="text-[10px] font-mono uppercase text-orange-400">{ins.category}</span>
-                        <p className="text-sm text-neutral-300 mt-1 whitespace-pre-line">{ins.content}</p>
-                      </div>
-                    ))}
-                  </div>
-                )}
+            <div className="bg-neutral-900 border border-neutral-800 p-6 rounded-2xl space-y-4">
+              <div className="flex justify-between items-center">
+                <h3 className="text-xs font-mono uppercase text-neutral-400 tracking-wider">Jarvis'in Analizleri</h3>
+                <button onClick={runWeeklyAnalysis} disabled={analyzing}
+                  className="bg-emerald-500 text-black text-xs font-bold px-4 py-2 rounded-lg disabled:opacity-50">
+                  {analyzing ? 'ANALİZ EDİLİYOR...' : 'ŞİMDİ ANALİZ ET'}
+                </button>
               </div>
+              {insights.length === 0 ? (
+                <p className="text-sm text-neutral-600 font-mono">Henüz kayıtlı içgörü yok. Bir hafta veri girdikten sonra "Şimdi Analiz Et" butonuna bas.</p>
+              ) : (
+                <div className="space-y-3 max-h-96 overflow-y-auto pr-2">
+                  {insights.map((ins) => (
+                    <div key={ins.id} className="p-4 bg-neutral-950 border border-neutral-800 rounded-xl">
+                      <span className="text-[10px] font-mono uppercase text-orange-400">{ins.category}</span>
+                      <p className="text-sm text-neutral-300 mt-1 whitespace-pre-line">{ins.content}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -595,6 +729,253 @@ function WeightSparkline({ metrics }) {
     <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-16">
       <path d={path} fill="none" stroke="#f97316" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
+  );
+}
+
+const CHART_TOOLTIP_STYLE = {
+  contentStyle: { background: '#171717', border: '1px solid #404040', borderRadius: '8px', fontSize: '11px' },
+  labelStyle: { color: '#a3a3a3' },
+};
+
+function JarvisChatPanel({ messages, input, sending, onInputChange, onSubmit, chatEndRef }) {
+  return (
+    <div className="space-y-4 animate-fadeIn max-w-3xl mx-auto">
+      <div className="bg-neutral-900 border border-neutral-800 rounded-2xl flex flex-col h-[calc(100vh-220px)] min-h-[420px]">
+        <div className="px-5 py-4 border-b border-neutral-800 flex items-center gap-3">
+          <span className="text-2xl">🤖</span>
+          <div>
+            <h2 className="font-black text-sm tracking-wide">JARVIS</h2>
+            <p className="text-[10px] font-mono text-neutral-500">Beslenme · Antrenman · Hedefler</p>
+          </div>
+          <span className="ml-auto text-[10px] font-mono text-emerald-500 bg-emerald-500/10 px-2 py-1 rounded-full border border-emerald-500/20">CANLI</span>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-4 space-y-3">
+          {messages.map((msg, i) => (
+            <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+              <div className={`max-w-[85%] px-4 py-3 rounded-2xl text-sm leading-relaxed ${
+                msg.role === 'user'
+                  ? 'bg-orange-500 text-black font-medium rounded-br-md'
+                  : 'bg-neutral-950 border border-neutral-800 text-neutral-200 rounded-bl-md'
+              }`}>
+                {msg.text}
+                {msg.intent && msg.intent !== 'chat' && (
+                  <span className="block mt-1.5 text-[9px] font-mono opacity-60 uppercase">{msg.intent.replace(/_/g, ' ')}</span>
+                )}
+              </div>
+            </div>
+          ))}
+          {sending && (
+            <div className="flex justify-start">
+              <div className="bg-neutral-950 border border-neutral-800 px-4 py-3 rounded-2xl rounded-bl-md text-sm text-neutral-500 font-mono animate-pulse">
+                Jarvis düşünüyor...
+              </div>
+            </div>
+          )}
+          <div ref={chatEndRef} />
+        </div>
+
+        <form onSubmit={onSubmit} className="p-4 border-t border-neutral-800 flex gap-2">
+          <input
+            type="text"
+            value={input}
+            onChange={(e) => onInputChange(e.target.value)}
+            placeholder="Örn: 3 yumurta yedim, bench 80kg x 8..."
+            disabled={sending}
+            className="flex-1 bg-neutral-950 border border-neutral-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-orange-500 disabled:opacity-50"
+          />
+          <button type="submit" disabled={sending || !input.trim()}
+            className="bg-orange-500 text-black font-bold px-5 py-3 rounded-xl text-sm disabled:opacity-40">
+            GÖNDER
+          </button>
+        </form>
+      </div>
+
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[10px] font-mono text-neutral-600">
+        {['3 yumurta yedim', 'bench 80kg x 8', 'kilo 78.5', 'dün ne yedim?'].map((hint) => (
+          <button key={hint} type="button" onClick={() => onInputChange(hint)}
+            className="bg-neutral-900 border border-neutral-800 rounded-lg px-2 py-2 hover:border-neutral-600 hover:text-neutral-400 transition-colors text-left truncate">
+            {hint}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function FoodPhotoUpload({ preview, analyzing, error, inputRef, onFileSelect, onConfirm, onCancel }) {
+  return (
+    <div className="bg-neutral-900 border border-neutral-800 p-6 rounded-2xl space-y-4">
+      <div className="flex justify-between items-center">
+        <h3 className="text-xs font-mono uppercase text-neutral-400 tracking-wider">📸 Tabak Fotoğrafı ile Kaydet</h3>
+        <input
+          ref={inputRef}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          className="hidden"
+          onChange={(e) => { if (e.target.files?.[0]) onFileSelect(e.target.files[0]); e.target.value = ''; }}
+        />
+        {!preview && (
+          <button
+            onClick={() => inputRef.current?.click()}
+            disabled={analyzing}
+            className="bg-emerald-500 text-black text-xs font-bold px-4 py-2 rounded-lg disabled:opacity-50"
+          >
+            {analyzing ? 'ANALİZ EDİLİYOR...' : 'FOTOĞRAF YÜKLE'}
+          </button>
+        )}
+      </div>
+
+      {error && <p className="text-xs text-red-400">{error}</p>}
+
+      {preview && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <img src={preview.previewUrl} alt="Yemek" className="rounded-xl border border-neutral-800 w-full max-h-48 object-cover" />
+          <div className="space-y-3">
+            <div>
+              <p className="font-bold text-white">{preview.meal_name}</p>
+              <p className="text-xs text-neutral-400 mt-1">{preview.description}</p>
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-xs font-mono">
+              <span className="bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2">{preview.calories?.toFixed(0)} kcal</span>
+              <span className="bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2">{preview.protein?.toFixed(0)}g protein</span>
+              <span className="bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2">{preview.carbs?.toFixed(0)}g karb</span>
+              <span className="bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2">{preview.fats?.toFixed(0)}g yağ</span>
+            </div>
+            {preview.confidence === 'low' && (
+              <p className="text-[10px] text-orange-400 font-mono">⚠️ Düşük güven — makroları kontrol edin</p>
+            )}
+            <div className="flex gap-2">
+              <button onClick={onCancel} className="flex-1 bg-neutral-800 text-white text-xs font-bold py-2.5 rounded-lg">İPTAL</button>
+              <button onClick={onConfirm} className="flex-1 bg-emerald-500 text-black text-xs font-bold py-2.5 rounded-lg">KAYDET</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {!preview && !analyzing && (
+        <p className="text-xs text-neutral-600 font-mono">Tabak fotoğrafını yükle — AI makroları hesaplasın, sen onayla.</p>
+      )}
+    </div>
+  );
+}
+
+function ProgressChartsSection({ chartData, loading, metrics, weightDelta, weightInput, savingWeight, onWeightInputChange, onSubmitWeight }) {
+  const formatDate = (d) => {
+    if (!d) return '';
+    const parts = d.split('-');
+    return parts.length >= 3 ? `${parts[2]}/${parts[1]}` : d;
+  };
+
+  const nutritionChart = chartData?.nutrition?.map((d) => ({
+    ...d,
+    label: formatDate(d.date),
+    calTarget: chartData?.targets?.calories || 0,
+    protTarget: chartData?.targets?.protein || 0,
+  })) || [];
+
+  const weightChart = chartData?.weight?.map((d) => ({
+    ...d,
+    label: formatDate(d.date),
+  })) || [];
+
+  const volumeChart = chartData?.volume || [];
+
+  if (loading) {
+    return <p className="text-sm text-neutral-600 font-mono">Grafikler yükleniyor...</p>;
+  }
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      {/* Kilo trendi */}
+      <div className="bg-neutral-900 border border-neutral-800 p-6 rounded-2xl space-y-4">
+        <h3 className="text-xs font-mono uppercase text-neutral-400 tracking-wider">Kilo Trendi (14 gün)</h3>
+        {weightChart.length === 0 ? (
+          <p className="text-sm text-neutral-600 font-mono">Henüz kilo kaydı yok.</p>
+        ) : (
+          <ResponsiveContainer width="100%" height={180}>
+            <LineChart data={weightChart}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#262626" />
+              <XAxis dataKey="label" tick={{ fill: '#737373', fontSize: 10 }} />
+              <YAxis domain={['auto', 'auto']} tick={{ fill: '#737373', fontSize: 10 }} width={35} />
+              <Tooltip contentStyle={CHART_TOOLTIP_STYLE.contentStyle} formatter={(v) => [`${v} kg`, 'Kilo']} />
+              <Line type="monotone" dataKey="weight" stroke="#f97316" strokeWidth={2} dot={{ fill: '#f97316', r: 3 }} />
+            </LineChart>
+          </ResponsiveContainer>
+        )}
+        {weightDelta !== null && (
+          <p className="text-xs font-mono text-neutral-400">
+            Dönem değişimi: <span className={weightDelta <= 0 ? 'text-emerald-400' : 'text-orange-400'}>{weightDelta > 0 ? '+' : ''}{weightDelta.toFixed(1)} kg</span>
+          </p>
+        )}
+        <form onSubmit={onSubmitWeight} className="flex gap-2 pt-2">
+          <input type="number" step="0.1" placeholder="kg" value={weightInput}
+            onChange={(e) => onWeightInputChange(e.target.value)}
+            className="flex-1 bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:border-orange-500" />
+          <button type="submit" disabled={savingWeight}
+            className="bg-orange-500 text-black text-xs font-bold px-4 py-2 rounded-lg disabled:opacity-50">
+            {savingWeight ? '...' : 'KAYDET'}
+          </button>
+        </form>
+      </div>
+
+      {/* Makro uyumu */}
+      <div className="bg-neutral-900 border border-neutral-800 p-6 rounded-2xl space-y-4">
+        <h3 className="text-xs font-mono uppercase text-neutral-400 tracking-wider">Günlük Kalori (Plan vs Gerçek)</h3>
+        {nutritionChart.length === 0 ? (
+          <p className="text-sm text-neutral-600 font-mono">Beslenme verisi yok.</p>
+        ) : (
+          <ResponsiveContainer width="100%" height={180}>
+            <BarChart data={nutritionChart}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#262626" />
+              <XAxis dataKey="label" tick={{ fill: '#737373', fontSize: 10 }} />
+              <YAxis tick={{ fill: '#737373', fontSize: 10 }} width={40} />
+              <Tooltip contentStyle={CHART_TOOLTIP_STYLE.contentStyle} />
+              <ReferenceLine y={chartData?.targets?.calories} stroke="#10b981" strokeDasharray="4 4" label={{ value: 'Hedef', fill: '#10b981', fontSize: 10 }} />
+              <Bar dataKey="calories" fill="#f97316" radius={[4, 4, 0, 0]} name="Kalori" />
+            </BarChart>
+          </ResponsiveContainer>
+        )}
+      </div>
+
+      {/* Protein trendi */}
+      <div className="bg-neutral-900 border border-neutral-800 p-6 rounded-2xl space-y-4">
+        <h3 className="text-xs font-mono uppercase text-neutral-400 tracking-wider">Günlük Protein</h3>
+        {nutritionChart.length === 0 ? (
+          <p className="text-sm text-neutral-600 font-mono">Protein verisi yok.</p>
+        ) : (
+          <ResponsiveContainer width="100%" height={180}>
+            <BarChart data={nutritionChart}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#262626" />
+              <XAxis dataKey="label" tick={{ fill: '#737373', fontSize: 10 }} />
+              <YAxis tick={{ fill: '#737373', fontSize: 10 }} width={40} />
+              <Tooltip contentStyle={CHART_TOOLTIP_STYLE.contentStyle} formatter={(v) => [`${v}g`, 'Protein']} />
+              <ReferenceLine y={chartData?.targets?.protein} stroke="#10b981" strokeDasharray="4 4" />
+              <Bar dataKey="protein" fill="#10b981" radius={[4, 4, 0, 0]} name="Protein (g)" />
+            </BarChart>
+          </ResponsiveContainer>
+        )}
+      </div>
+
+      {/* Kas hacmi */}
+      <div className="bg-neutral-900 border border-neutral-800 p-6 rounded-2xl space-y-4">
+        <h3 className="text-xs font-mono uppercase text-neutral-400 tracking-wider">Haftalık Kas Grubu Hacmi (Set)</h3>
+        {volumeChart.length === 0 ? (
+          <p className="text-sm text-neutral-600 font-mono">Antrenman verisi yok.</p>
+        ) : (
+          <ResponsiveContainer width="100%" height={180}>
+            <BarChart data={volumeChart} layout="vertical" margin={{ left: 10 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#262626" horizontal={false} />
+              <XAxis type="number" tick={{ fill: '#737373', fontSize: 10 }} />
+              <YAxis type="category" dataKey="muscle_group" tick={{ fill: '#a3a3a3', fontSize: 10 }} width={60} />
+              <Tooltip contentStyle={CHART_TOOLTIP_STYLE.contentStyle} formatter={(v) => [`${v} set`, 'Hacim']} />
+              <Bar dataKey="sets" fill="#ea580c" radius={[0, 4, 4, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        )}
+      </div>
+    </div>
   );
 }
 

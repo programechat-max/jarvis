@@ -215,6 +215,79 @@ def create_nutrition_entry(entry: schemas.NutritionLogCreate, db: Session = Depe
     return crud.create_nutrition_log(db, entry)
 
 
+MAX_PHOTO_BYTES = 15 * 1024 * 1024
+
+
+@app.post("/api/nutrition/photo")
+async def analyze_nutrition_photo(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Yemek/fizik fotoğrafını analiz eder ama kaydetmez — web arayüzünde kullanıcı
+    makroları onayladıktan sonra /api/nutrition/photo/confirm ile kaydedilir."""
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Boş fotoğraf dosyası.")
+    if len(image_bytes) > MAX_PHOTO_BYTES:
+        raise HTTPException(status_code=413, detail="Fotoğraf çok büyük (15MB üstü).")
+    mime_type = file.content_type or "image/jpeg"
+    try:
+        return ai_core.analyze_photo(image_bytes, mime_type, db, save=False)
+    except Exception as e:
+        logger.error(f"[NUTRITION] Fotoğraf analizi hatası: {e}")
+        raise HTTPException(status_code=500, detail=f"Fotoğraf analiz edilemedi: {e}")
+
+
+@app.post("/api/nutrition/photo/confirm", response_model=schemas.NutritionLogResponse)
+def confirm_nutrition_photo(entry: schemas.NutritionLogCreate, db: Session = Depends(get_db)):
+    """Web'de fotoğraf analizi sonrası kullanıcının onayladığı öğünü kaydeder."""
+    return crud.create_nutrition_log(db, entry)
+
+
+# ==========================================
+# JARVIS SOHBET (web arayüzü)
+# ==========================================
+@app.post("/api/chat", response_model=schemas.ChatResponse)
+def chat_with_jarvis(body: schemas.ChatRequest, db: Session = Depends(get_db)):
+    """Web dashboard'dan Jarvis ile sohbet. Telegram'daki process_message ile aynı motor."""
+    message = (body.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Mesaj boş olamaz.")
+    result = ai_core.process_message(message, db)
+    return schemas.ChatResponse(
+        intent=result.get("intent", "chat"),
+        jarvis_reply=result.get("jarvis_reply", "Anlayamadım efendim, tekrar dener misiniz?"),
+        data=result.get("data") or {},
+    )
+
+
+# ==========================================
+# GELİŞİM GRAFİKLERİ (birleşik veri)
+# ==========================================
+@app.get("/api/progress/charts")
+def get_progress_charts(days: int = 14, db: Session = Depends(get_db)):
+    """Dashboard gelişim sekmesi için birleşik grafik verisi."""
+    profile = crud.get_or_create_profile(db)
+    metrics = crud.get_body_metrics(db, days=days)
+    nutrition_history = crud.get_nutrition_history(db, days=days)
+    volume = crud.get_weekly_volume_by_muscle_group(db, days=days)
+    meal_plan = crud.get_meal_plan(db)
+
+    if meal_plan:
+        planned_cal = sum(m.calories for m in meal_plan)
+        planned_prot = sum(m.protein for m in meal_plan)
+    else:
+        planned_cal = profile.daily_calorie_target or 2200
+        planned_prot = profile.daily_protein_target or 140
+
+    return {
+        "weight": [{"date": str(m.date), "weight": m.weight} for m in metrics if m.weight],
+        "nutrition": nutrition_history,
+        "volume": [{"muscle_group": k, "sets": v} for k, v in sorted(volume.items(), key=lambda x: -x[1])],
+        "targets": {
+            "calories": planned_cal,
+            "protein": planned_prot,
+        },
+    }
+
+
 # ==========================================
 # BESLENME PLANI (AI önerisi - "ne yemelisin")
 # ==========================================

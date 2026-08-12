@@ -128,3 +128,13 @@ class MealPlanItemResponse(MealPlanItemCreate):
     created_at: datetime
     class Config:
         from_attributes = True
+
+
+# --- SOHBET ŞEMALARI ---
+class ChatRequest(BaseModel):
+    message: str
+
+class ChatResponse(BaseModel):
+    intent: str
+    jarvis_reply: str
+    data: dict = {}
