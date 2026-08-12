@@ -254,7 +254,7 @@ def create_memory(db: Session, category: str, content: str):
     return db_mem
 
 
-def get_recent_memories(db: Session, limit: int = 15):
+def get_recent_memories(db: Session, limit: int = 40):
     return db.query(models.UserMemory).order_by(models.UserMemory.id.desc()).limit(limit).all()
 
 

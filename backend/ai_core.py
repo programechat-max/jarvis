@@ -23,6 +23,24 @@ import crud
 import schemas
 import progression
 from database import SessionLocal
+from food_matcher import (
+    clean_user_message,
+    try_resolve_plan_food_locally,
+    validate_food_intent,
+    wants_whole_plan_log,
+    wants_plan_meal_log,
+    extract_meal_hint,
+    find_plan_meal,
+    log_all_plan_meals,
+    log_plan_meal,
+    no_plan_reply,
+)
+from memory_context import (
+    build_memory_block,
+    build_operational_context,
+    format_user_prompt,
+    save_conversation_memory,
+)
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -31,12 +49,46 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=API_KEY)
 
 MODEL_NAME = "gemini-3.1-flash-lite"
+AI_CORE_VERSION = "2026-08-12-v3"
 
 BASE_PERSONA = """
 Sen kullanıcının kişisel 'Jarvis' adındaki elit, sadık ve zeki fitness/sağlık asistanısın.
 Iron Man filmindeki Jarvis gibi asil, sadık, hafif nüktedan ve tamamen kullanıcı odaklısın.
 Kullanıcıya her zaman "efendim" diye hitap et. Kuru, robotik onay cümleleri kurma;
 onunla gerçek bir koç gibi, doğal ve samimi konuş. Yanlış bir bilgi varsa nazikçe düzelt.
+
+BİLİŞSEL YETENEKLERİN:
+1. KALICI HAFIZA bloğunu her mesajda oku — kullanıcının tercihlerini, sakatlıklarını, alışkanlıklarını UNUTMA.
+2. Geçmiş konuşmayı dikkate al; "onu yedim", "evet hepsini" gibi takip mesajlarını bağlamdan anla.
+3. Beslenme PLANI (öneri) ile BUGÜN YEDİKLERİM (log) ayrımını kesin yap.
+4. "Tüm öğünlerimi tamamladım/yedim" = TÜM planı kaydet; asla tek öğün adı sanma.
+5. Hipertrofi hedefi varsa bilimsel, kanıta dayalı hareket ve hacim öner.
+"""
+
+HYPERTROPHY_PROGRAM_RULES = """
+MAKSİMUM HİPERTROFİ PROGRAM KURALLARI (kullanıcı hipertrofi/kas kütlesi dediyse ZORUNLU):
+
+Bilimsel temel: haftalık 10-20 set/kas grubu, çoğu set 6-15 tekrar, 0-3 RIR, progressive overload.
+
+HAREKET SEÇİMİ — kas grubu başına ÖNCELİK SIRASI:
+• Göğüs: Barbell/Dumbbell Bench Press → Incline DB Press → Cable Fly / Pec Deck
+• Sırt: Weighted Pull-up/Lat Pulldown → Barbell/Chest-supported Row → Straight-arm Pulldown
+• Bacak: Barbell Back/Front Squat → Romanian Deadlift → Leg Press → Leg Curl
+• Hamstring: RDL → Lying/Seated Leg Curl
+• Glute: Hip Thrust → Bulgarian Split Squat
+• Omuz: Overhead Press → Lateral Raise (kablo veya dambıl) → Rear Delt Fly
+• Biceps: Chin-up (supinated) veya İncline Dumbbell Curl → Bayesian Cable Curl
+  (Barbell Curl tek başına ana hareket OLMASIN — bileşik çekiş + stretch pozisyonu tercih)
+• Triceps: Close-grip Bench veya Dips → Overhead Triceps Extension → Pushdown
+• Karın: Cable Crunch → Hanging Leg Raise
+
+YASAK / ZAYIF SEÇİMLER (hipertrofi için tek başına yetersiz):
+- Sadece izole makine hareketleriyle dolu program
+- Aynı kas grubuna günde 1 zayıf hareket (örn. sadece Barbell Curl biceps günü)
+- Her gün farklı random hareket; split tutarlı olmalı
+
+SPLIT: 3-5 gün; Push/Pull/Legs veya Upper/Lower tercih et. Her kas 2x/hafta minimum.
+Her gün 1-2 bileşik + 2-3 izole; toplam 4-6 hareket/gün.
 """
 
 
@@ -49,7 +101,7 @@ def build_system_prompt(db=None) -> str:
         db = SessionLocal()
     try:
         profile = crud.get_or_create_profile(db)
-        memories = crud.get_recent_memories(db, limit=10)
+        memory_block = build_memory_block(db)
 
         profile_block = f"""
 KULLANICI PROFİLİ:
@@ -63,12 +115,6 @@ KULLANICI PROFİLİ:
 - Günlük hedefler: {profile.daily_calorie_target} kcal, {profile.daily_protein_target}g protein,
   {profile.daily_carb_target}g karbonhidrat, {profile.daily_fat_target}g yağ
 """
-
-        if memories:
-            mem_lines = "\n".join(f"- ({m.category}) {m.content}" for m in memories)
-            memory_block = f"\nJARVIS'İN KULLANICI HAKKINDA BİRİKTİRDİĞİ HAFIZA:\n{mem_lines}\n"
-        else:
-            memory_block = "\n(Henüz kayıtlı bir hafıza yok - kullanıcıyı tanımaya başlıyorsun.)\n"
 
         meal_plan = crud.get_meal_plan(db)
         if meal_plan:
@@ -94,19 +140,14 @@ JSON dışında hiçbir şey yazma.
 {
   "intent": "log_food" | "log_workout" | "log_weight" | "remember" | "query_history" | "modify_meal_plan" | "delete_meal_plan" | "delete_food_log" | "modify_workout_program" | "delete_workout_program" | "chat",
   "data": {
-    // log_food ise: "meal_name", "description", "calories", "protein", "carbs", "fats", "matched_plan_meal"
-    //   KURAL 1 - Kullanıcı NE YEDİĞİNİ somut olarak tarif ettiyse (malzeme/miktar belirtmiş,
-    //     örn. "3 yumurta yedim", "150g tavuk ve pirinç yedim"): description'a bunu yaz,
-    //     calories/protein/carbs/fats'ı bu tarife göre rasyonel hesapla. matched_plan_meal: null.
-    //   KURAL 2 - Kullanıcı SADECE "planımdaki kahvaltıyı/öğle yemeğimi/X öğününü yedim" gibi
-    //     BELİRSİZ bir ifade kullandıysa (ne yediğini TARİF ETMEDEN, sadece plan öğününe atıfla):
-    //     calories/protein/carbs/fats alanlarına 0 yaz (bunlar KULLANILMAYACAK, kod gerçek plan
-    //     verisini DB'den çekip kullanacak) ve matched_plan_meal alanına o öğünün planındaki
-    //     TAM meal_name'ini yaz (örn. "Kahvaltı", "Öğle Yemeği") - SİSTEM PROMPT'taki güncel
-    //     BESLENME PLANI bölümünden hangi öğün olduğunu belirle. Eşleşen öğün yoksa null yaz ve
-    //     jarvis_reply'de kullanıcıya ne yediğini sorman GEREKİR, kaydetme.
-    //   ASLA sayısal alanlara rastgele/uydurma değer yazıp matched_plan_meal'i de null bırakma -
-    //     ya somut tarife dayalı gerçek hesap yap, ya da plana yönlendir, ikisi de değilse SOR.
+    // log_food ise: "meal_name", "description", "calories", "protein", "carbs", "fats",
+    //   "matched_plan_meal", "log_entire_plan"
+    //   KURAL A - Somut tarif (3 yumurta yedim): description + makrolar hesapla, matched_plan_meal: null, log_entire_plan: false
+    //   KURAL B - TEK plan öğünü (planımdaki kahvaltıyı yedim): matched_plan_meal: plan listesindeki TAM ad, makrolar 0
+    //   KURAL C - TÜM PLAN (ZORUNLU log_entire_plan: true, matched_plan_meal: null):
+    //     "tüm öğünlerimi yedim/tamamladım", "hepsini yedim", "günün menüsünü bitirdim",
+    //     "beslenme programımı uyguladım", "plana uygun yedim"
+    //     "tüm öğünlerimi tamamladım" bir meal_name DEĞİLDİR — ASLA matched_plan_meal olarak yazma!
 
     // log_workout ise: "sets" adında bir LİSTE ver. Kullanıcı tek mesajda birden fazla
     //   hareket veya set anlatabilir (örn. "bench 4x8 60kg, sonra dips 3x12 vücut ağırlığı") -
@@ -197,79 +238,88 @@ def _safe_int(value, default=0):
     return int(_safe_float(value, default))
 
 
-def process_message(user_message: str, db=None) -> dict:
+def process_message(user_message: str, db=None, conversation_history: list | None = None) -> dict:
     """Tek giriş noktası: mesajı analiz eder, intent'e göre veritabanına yazar
-    ve kullanıcıya verilecek yanıtı döndürür. Telegram botu ve ileride
-    API/chat endpoint'i bu fonksiyonu kullanır."""
+    ve kullanıcıya verilecek yanıtı döndürür."""
+    user_message = clean_user_message(user_message)
     own_session = db is None
     if own_session:
         db = SessionLocal()
     try:
-        system_instruction = build_system_prompt(db) + INTENT_INSTRUCTIONS
+        local_food = try_resolve_plan_food_locally(user_message, db)
+        if local_food:
+            logger.info("[AI_CORE] Yerel plan eşleşme: %r", user_message[:60])
+            return local_food
+
+        operational_context = build_operational_context(db, conversation_history)
+        system_instruction = build_system_prompt(db) + operational_context + INTENT_INSTRUCTIONS
         model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=system_instruction)
 
+        prompt = format_user_prompt(user_message, conversation_history)
         response = model.generate_content(
-            user_message,
-            generation_config={"response_mime_type": "application/json", "temperature": 0.4},
+            prompt,
+            generation_config={"response_mime_type": "application/json", "temperature": 0.25},
         )
         result = json.loads(response.text)
         intent = result.get("intent")
         data = result.get("data", {}) or {}
 
         if intent == "log_food":
-            import schemas
-            matched_meal_name = data.get("matched_plan_meal")
+            plan_items = crud.get_meal_plan(db)
+            data = validate_food_intent(user_message, data, plan_items)
 
-            if matched_meal_name:
-                # Kullanıcı "planımdaki X'i yedim" dedi - AI'nin uydurduğu değil,
-                # veritabanındaki GERÇEK plan verisini kullan.
-                plan_items = crud.get_meal_plan(db)
-                matched = next(
-                    (p for p in plan_items if p.meal_name.strip().lower() == matched_meal_name.strip().lower()),
-                    None,
-                )
-                if matched:
-                    crud.create_nutrition_log(db, schemas.NutritionLogCreate(
-                        meal_name=matched.meal_name,
-                        ingredients=matched.description,
-                        calories=matched.calories,
-                        protein=matched.protein,
-                        carbs=matched.carbs,
-                        fats=matched.fats,
-                    ))
-                    result["jarvis_reply"] = (
-                        f"✅ {matched.meal_name} kaydedildi efendim ({matched.calories:.0f} kcal, "
-                        f"{matched.protein:.0f}g protein) - plandaki haliyle."
-                    )
-                    result["_food_reply_is_final"] = True
+            if data.get("log_entire_plan"):
+                if plan_items:
+                    result.update(log_all_plan_meals(db, plan_items))
                 else:
-                    # AI plan içinde eşleşme bulamadı ama yine de matched_plan_meal döndürmüş -
-                    # veri uydurmak yerine kullanıcıya sor.
-                    result["jarvis_reply"] = (
-                        "Planında bu isimde bir öğün bulamadım efendim. Ne yediğini biraz "
-                        "tarif eder misin, öyle kaydedeyim?"
-                    )
-                    result["intent"] = "chat"
+                    result.update(no_plan_reply())
             else:
-                calories = _safe_float(data.get("calories"), default=None)
-                # AI hem plana eşlemedi hem de somut bir kalori hesaplamadıysa (description boş/
-                # belirsiz), rastgele 0 kaydetmek yerine kullanıcıya sor.
-                description = data.get("description", "").strip()
-                if calories is None and not description:
-                    result["jarvis_reply"] = (
-                        "Ne yediğini biraz daha tarif eder misin efendim? (örn. '3 yumurta ve "
-                        "1 dilim ekmek' gibi) - net bir tarif olmadan makroları uyduramam."
-                    )
-                    result["intent"] = "chat"
+                matched_meal_name = data.get("matched_plan_meal")
+                matched = find_plan_meal(plan_items, matched_meal_name) if matched_meal_name else None
+
+                if not matched and plan_items:
+                    hint = extract_meal_hint(user_message)
+                    if hint:
+                        matched = find_plan_meal(plan_items, hint)
+                    if not matched and wants_whole_plan_log(user_message):
+                        result.update(log_all_plan_meals(db, plan_items))
+                        matched = "__all__"
+
+                if matched == "__all__":
+                    pass
+                elif matched:
+                    result.update(log_plan_meal(db, matched))
+                elif matched_meal_name or wants_plan_meal_log(user_message):
+                    if wants_whole_plan_log(user_message) and plan_items:
+                        result.update(log_all_plan_meals(db, plan_items))
+                    elif plan_items:
+                        result["jarvis_reply"] = (
+                            f"Planında '{matched_meal_name or 'bu öğün'}' bulamadım efendim. "
+                            f"Mevcut öğünler: {', '.join(p.meal_name for p in plan_items)}.\n"
+                            f"Tüm planı yediysen 'tüm öğünlerimi tamamladım' diyebilirsin."
+                        )
+                        result["intent"] = "chat"
+                        result["_food_reply_is_final"] = True
+                    else:
+                        result.update(no_plan_reply())
                 else:
-                    crud.create_nutrition_log(db, schemas.NutritionLogCreate(
-                        meal_name=data.get("meal_name", "Öğün"),
-                        ingredients=description or user_message,
-                        calories=_safe_float(data.get("calories")),
-                        protein=_safe_float(data.get("protein")),
-                        carbs=_safe_float(data.get("carbs")),
-                        fats=_safe_float(data.get("fats")),
-                    ))
+                    calories = _safe_float(data.get("calories"), default=None)
+                    description = data.get("description", "").strip()
+                    if calories is None and not description:
+                        result["jarvis_reply"] = (
+                            "Ne yediğini biraz daha tarif eder misin efendim? (örn. '3 yumurta ve "
+                            "1 dilim ekmek' gibi) - net bir tarif olmadan makroları uyduramam."
+                        )
+                        result["intent"] = "chat"
+                    else:
+                        crud.create_nutrition_log(db, schemas.NutritionLogCreate(
+                            meal_name=data.get("meal_name", "Öğün"),
+                            ingredients=description or user_message,
+                            calories=_safe_float(data.get("calories")),
+                            protein=_safe_float(data.get("protein")),
+                            carbs=_safe_float(data.get("carbs")),
+                            fats=_safe_float(data.get("fats")),
+                        ))
         elif intent == "log_workout":
             import schemas
             # AI'den birden fazla set (çoklu hareket / farklı ağırlıklar) gelebilir.
@@ -319,7 +369,8 @@ def process_message(user_message: str, db=None) -> dict:
                 sleep_hours=_safe_float(data.get("sleep_hours"), default=None) if data.get("sleep_hours") is not None else None,
             ))
         elif intent == "remember":
-            crud.create_memory(db, category=data.get("category", "preference"), content=data.get("content", user_message))
+            content = data.get("content", user_message)
+            crud.create_memory(db, category=data.get("category", "preference"), content=content)
         elif intent == "query_history":
             days_ago = _safe_int(data.get("days_ago"), default=7)
             target_date = date.today() - timedelta(days=days_ago)
@@ -411,6 +462,10 @@ def process_message(user_message: str, db=None) -> dict:
                 result["jarvis_reply"] = "\n".join(lines)
             else:
                 result["jarvis_reply"] = "Programı güncellerken bir sorun oldu efendim, tekrar dener misin?"
+
+        reply_text = result.get("jarvis_reply", "")
+        if intent in ("remember", "chat"):
+            save_conversation_memory(db, user_message, reply_text)
 
         return result
     except Exception as e:
@@ -598,6 +653,12 @@ KULLANICININ İSTEĞİ: "{user_instruction}"
 Bu isteği uygula. Bahsedilmeyen günleri/hareketleri mümkün olduğunca aynı bırak.
 """
 
+        goal_lower = (profile.goal or "").lower()
+        is_hypertrophy = any(w in goal_lower for w in [
+            "hipertrofi", "kas", "kütlesi", "bulk", "hypertrophy", "muscle", "kitle"
+        ])
+        hypertrophy_block = HYPERTROPHY_PROGRAM_RULES if is_hypertrophy else ""
+
         prompt = f"""
 Kullanıcı için HAFTALIK bir antrenman programı oluştur.
 - Deneyim: {profile.experience_months or 0} ay
@@ -605,16 +666,15 @@ Kullanıcı için HAFTALIK bir antrenman programı oluştur.
 - Aktivite seviyesi: {profile.activity_level}
 - Sakatlık/kısıtlama notları: {profile.injury_notes or 'yok'} (varsa bu bölgeleri zorlayan hareketlerden kaçın)
 {existing_block}
-3-5 antrenman günü oluştur (örn. "Pazartesi - İtiş (Göğüs/Omuz/Triceps)"). Her gün için 4-6 hareket,
-her hareket için hedef set sayısı, tekrar aralığı ("8-12" gibi) ve HANGİ ANA KAS GRUBUNU
-çalıştırdığını (muscle_group: "Göğüs", "Sırt", "Bacak", "Omuz", "Kol", "Karın" gibi TEK bir
-kelime/grup - haftalık hacim takibi için bu alan ZORUNLU) belirt.
+{hypertrophy_block}
+3-5 antrenman günü oluştur. Her gün 4-6 hareket; her hareket için target_sets, target_reps ("8-12"),
+muscle_group (Göğüs|Sırt|Bacak|Omuz|Kol|Karın|Glute|Hamstring) ZORUNLU.
 
-SADECE aşağıdaki JSON formatında bir liste dön, başka hiçbir şey yazma:
+SADECE JSON liste dön:
 [
-  {{"day_name": "Pazartesi - İtiş Günü", "exercises": [
-    {{"name": "Bench Press", "target_sets": 4, "target_reps": "8-12", "muscle_group": "Göğüs"}},
-    {{"name": "Shoulder Press", "target_sets": 3, "target_reps": "10-12", "muscle_group": "Omuz"}}
+  {{"day_name": "Pazartesi - İtiş", "exercises": [
+    {{"name": "Incline Dumbbell Press", "target_sets": 4, "target_reps": "8-12", "muscle_group": "Göğüs"}},
+    ...
   ]}},
   ...
 ]
