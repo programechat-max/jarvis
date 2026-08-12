@@ -9,11 +9,12 @@ from sqlalchemy import func
 from datetime import date
 
 import models, schemas, crud, ai_core, progression
-from database import SessionLocal, engine, get_db
+import jarvis_brain
+from database import SessionLocal, engine, get_db, migrate_schema
 
 logger = logging.getLogger(__name__)
 
-models.Base.metadata.create_all(bind=engine)
+migrate_schema()
 
 app = FastAPI(title="Jarvis Core Dashboard API")
 
@@ -246,16 +247,84 @@ def confirm_nutrition_photo(entry: schemas.NutritionLogCreate, db: Session = Dep
 # ==========================================
 @app.post("/api/chat", response_model=schemas.ChatResponse)
 def chat_with_jarvis(body: schemas.ChatRequest, db: Session = Depends(get_db)):
-    """Web dashboard'dan Jarvis ile sohbet. Telegram'daki process_message ile aynı motor."""
+    """Web dashboard'dan Jarvis ile sohbet — jarvis_brain zeka katmanı ile güçlendirilmiş."""
     message = (body.message or "").strip()
     if not message:
         raise HTTPException(status_code=400, detail="Mesaj boş olamaz.")
-    result = ai_core.process_message(message, db)
+    session_id = body.session_id or "default"
+    result = ai_core.process_message(message, db, session_id=session_id)
     return schemas.ChatResponse(
         intent=result.get("intent", "chat"),
         jarvis_reply=result.get("jarvis_reply", "Anlayamadım efendim, tekrar dener misiniz?"),
         data=result.get("data") or {},
+        enriched=bool(result.get("_enriched")),
+        training_advice=result.get("data", {}).get("training_advice"),
     )
+
+
+@app.get("/api/chat/history")
+def get_chat_history(session_id: str = "default", limit: int = 40, db: Session = Depends(get_db)):
+    rows = crud.get_chat_history(db, session_id=session_id, limit=limit)
+    return [
+        {"role": r.role, "text": r.content, "intent": r.intent, "created_at": r.created_at.isoformat()}
+        for r in rows
+    ]
+
+
+@app.delete("/api/chat/history")
+def clear_chat_history(session_id: str = "default", db: Session = Depends(get_db)):
+    deleted = crud.clear_chat_history(db, session_id=session_id)
+    return {"deleted": deleted}
+
+
+@app.get("/api/jarvis/briefing")
+def get_jarvis_briefing(db: Session = Depends(get_db)):
+    """Proaktif durum özeti — chat sekmesi açıldığında gösterilir."""
+    return jarvis_brain.generate_proactive_briefing(db)
+
+
+@app.post("/api/jarvis/checkin")
+def jarvis_daily_checkin(body: schemas.CheckInRequest, db: Session = Depends(get_db)):
+    """Yapılandırılmış günlük check-in."""
+    result = jarvis_brain.process_checkin(
+        db,
+        mood=body.mood,
+        energy=body.energy,
+        sleep_quality=body.sleep_quality,
+        soreness=body.soreness,
+        notes=body.notes,
+    )
+    return result
+
+
+@app.get("/api/memory")
+def list_memories(category: str = None, db: Session = Depends(get_db)):
+    """Jarvis hafıza paneli — tüm kayıtlar."""
+    memories = crud.get_all_memories(db, category=category)
+    return [
+        schemas.UserMemoryResponse.model_validate(m) for m in memories
+    ]
+
+
+@app.get("/api/memory/search")
+def search_memory(q: str, limit: int = 20, db: Session = Depends(get_db)):
+    results = crud.search_memories(db, q, limit=limit)
+    return [schemas.UserMemoryResponse.model_validate(m) for m in results]
+
+
+@app.put("/api/memory/{memory_id}", response_model=schemas.UserMemoryResponse)
+def update_memory(memory_id: int, body: schemas.UserMemoryUpdate, db: Session = Depends(get_db)):
+    mem = crud.update_memory(db, memory_id, content=body.content, category=body.category, importance=body.importance)
+    if not mem:
+        raise HTTPException(status_code=404, detail="Hafıza kaydı bulunamadı.")
+    return mem
+
+
+@app.delete("/api/memory/{memory_id}")
+def delete_memory(memory_id: int, db: Session = Depends(get_db)):
+    if crud.delete_memory(db, memory_id):
+        return {"status": "deleted"}
+    raise HTTPException(status_code=404, detail="Hafıza kaydı bulunamadı.")
 
 
 # ==========================================

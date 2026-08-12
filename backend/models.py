@@ -105,8 +105,38 @@ class UserMemory(Base):
     __tablename__ = "user_memory"
     id = Column(Integer, primary_key=True, index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    category = Column(String, default="note")  # preference | insight | analysis | note
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    category = Column(String, default="note")  # preference | insight | analysis | note | physique_analysis | onboarding_voice
     content = Column(Text)
+    importance = Column(Integer, default=5)  # 1-10, yüksek = daha kritik bilgi
+    keywords = Column(String, default="")  # virgülle ayrılmış arama anahtar kelimeleri
+    memory_key = Column(String, nullable=True, index=True)  # yapılandırılmış anahtar: diet.fish_dislike
+    access_count = Column(Integer, default=0)
+
+
+class ChatMessage(Base):
+    """Jarvis web/Telegram sohbet geçmişi — bağlam sürekliliği için."""
+    __tablename__ = "chat_messages"
+    id = Column(Integer, primary_key=True, index=True)
+    role = Column(String, index=True)  # user | jarvis
+    content = Column(Text)
+    intent = Column(String, nullable=True)
+    session_id = Column(String, default="default", index=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+
+class DailyCheckIn(Base):
+    """Günlük enerji/uyku/hazırlık check-in — Jarvis proaktif koçluğu için."""
+    __tablename__ = "daily_checkins"
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(Date, default=datetime.date.today, index=True)
+    mood = Column(Integer, nullable=True)  # 1-5
+    energy = Column(Integer, nullable=True)  # 1-5
+    sleep_quality = Column(Integer, nullable=True)  # 1-5
+    soreness = Column(Integer, nullable=True)  # 1-5 (kas ağrısı)
+    notes = Column(Text, nullable=True)
+    readiness_score = Column(Float, nullable=True)  # 0-100 hesaplanmış hazırlık
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
 class MealPlanItem(Base):
