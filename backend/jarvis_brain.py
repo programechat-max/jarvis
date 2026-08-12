@@ -432,7 +432,7 @@ def generate_proactive_briefing(db) -> dict:
         "briefing": briefing_text,
         "suggestions": suggestions[:4],
         "snapshot": snapshot,
-        "readiness": snapshot.get("checkin", {}).get("readiness_score"),
+        "readiness": (snapshot.get("checkin") or {}).get("readiness_score"),
         "goal": profile.goal,
     }
 
